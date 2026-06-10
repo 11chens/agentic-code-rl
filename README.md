@@ -4,6 +4,8 @@ Agentic Code RL is a compact research-style project for training and evaluating 
 
 The project is intentionally not embodied: it targets Agentic RL concepts that can be verified on a normal laptop.
 
+For a cold-start handoff to another agent, read [docs/COLD_START_HANDOFF.md](docs/COLD_START_HANDOFF.md).
+
 ## What It Demonstrates
 
 - Agent architecture: planner, memory, tool calls, reflection, trajectory logging.
