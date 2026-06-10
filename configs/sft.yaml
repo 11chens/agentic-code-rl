@@ -1,0 +1,7 @@
+tasks_dir: data/tasks
+output_dir: runs/training/sft
+checkpoint: runs/checkpoints/sft.json
+limit: 0
+epochs: 3
+learning_rate: 0.001
+resume_from: null
