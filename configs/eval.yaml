@@ -2,4 +2,4 @@ tasks_dir: data/tasks
 repos_dir: data/repos
 runs_dir: runs
 limit: 0
-test_timeout_sec: 10
+test_timeout_sec: 30

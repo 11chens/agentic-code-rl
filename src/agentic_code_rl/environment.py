@@ -20,6 +20,7 @@ class WorkspaceError(RuntimeError):
 class EpisodeWorkspace:
     task: TaskSpec
     repo_source: Path
+    hidden_source: Path | None
     root: Path
 
     @classmethod
@@ -27,18 +28,23 @@ class EpisodeWorkspace:
         repo_source = (repos_dir / task.repo_template).resolve()
         if not repo_source.exists():
             raise FileNotFoundError(f"Repo template not found: {repo_source}")
+        hidden_source = (repos_dir.parent / "hidden_tests" / task.repo_template).resolve()
+        if not hidden_source.exists():
+            hidden_source = None
         base = runs_dir.resolve() if runs_dir else Path(tempfile.mkdtemp(prefix="agentic-code-rl-"))
         base.mkdir(parents=True, exist_ok=True)
         workspace_root = base / "workspace"
         if workspace_root.exists():
             shutil.rmtree(workspace_root)
         shutil.copytree(repo_source, workspace_root)
-        return cls(task=task, repo_source=repo_source, root=workspace_root.resolve())
+        return cls(task=task, repo_source=repo_source, hidden_source=hidden_source, root=workspace_root.resolve())
 
     def resolve_path(self, relative: str | Path) -> Path:
         raw = Path(relative)
         if raw.is_absolute():
             raise WorkspaceError(f"Absolute paths are not allowed: {relative}")
+        if self._is_hidden_test_path(raw):
+            raise WorkspaceError(f"Hidden tests are not visible during an episode: {relative}")
         resolved = (self.root / raw).resolve()
         try:
             resolved.relative_to(self.root)
@@ -49,8 +55,9 @@ class EpisodeWorkspace:
     def list_files(self) -> list[str]:
         files: list[str] = []
         for path in self.root.rglob("*"):
-            if path.is_file() and not _is_ignored(path):
-                files.append(path.relative_to(self.root).as_posix())
+            relative = path.relative_to(self.root)
+            if path.is_file() and not _is_ignored(path) and not self._is_hidden_test_path(relative):
+                files.append(relative.as_posix())
         return sorted(files)
 
     def read_text(self, relative: str | Path, max_chars: int = 12000) -> str:
@@ -67,8 +74,9 @@ class EpisodeWorkspace:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
 
-    def run_tests(self, tests: list[str], scope: str, timeout_sec: int = 10) -> TestRunResult:
-        args = [sys.executable, "-m", "pytest", "-q", *tests]
+    def run_tests(self, tests: list[str], scope: str, timeout_sec: int = 30) -> TestRunResult:
+        test_args = self._resolve_test_args(tests, scope)
+        args = [sys.executable, "-m", "pytest", "-q", *test_args]
         env = os.environ.copy()
         src_path = str(self.root / "src")
         env["PYTHONPATH"] = src_path + os.pathsep + env.get("PYTHONPATH", "")
@@ -111,6 +119,34 @@ class EpisodeWorkspace:
                 passed_count=0,
                 timed_out=True,
             )
+
+    def _resolve_test_args(self, tests: list[str], scope: str) -> list[str]:
+        resolved: list[str] = []
+        for test in tests:
+            test_path = Path(test)
+            if test_path.is_absolute():
+                raise WorkspaceError(f"Absolute test paths are not allowed: {test}")
+            if scope.startswith("hidden") or (scope == "all" and self._is_hidden_test_path(test_path)):
+                resolved.append(str(self._resolve_hidden_test(test_path)))
+            else:
+                resolved.append(test_path.as_posix())
+        return resolved
+
+    def _resolve_hidden_test(self, relative: Path) -> Path:
+        if self.hidden_source is None:
+            raise WorkspaceError(f"Hidden test source not found for task {self.task.id}")
+        hidden_path = (self.hidden_source / relative).resolve()
+        try:
+            hidden_path.relative_to(self.hidden_source)
+        except ValueError as exc:
+            raise WorkspaceError(f"Hidden test path escapes hidden source: {relative}") from exc
+        if not hidden_path.exists() or not hidden_path.is_file():
+            raise WorkspaceError(f"Hidden test not found: {relative.as_posix()}")
+        return hidden_path
+
+    def _is_hidden_test_path(self, relative: str | Path) -> bool:
+        normalized = Path(relative).as_posix()
+        return normalized in {Path(item).as_posix() for item in self.task.hidden_tests}
 
 
 def _is_ignored(path: Path) -> bool:

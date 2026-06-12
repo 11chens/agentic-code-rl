@@ -2,6 +2,8 @@
 
 ## Architecture
 
+This project uses "harness" narrowly. The harness is the code-repair evaluation and tool-execution boundary: isolated workspace setup, guarded file operations, controlled patch application, public/hidden test separation, timeout handling, and standard artifacts. The MDP-style loop and PPO/GRPO updates are training logic, not separate harness concepts.
+
 ```text
 TaskSpec
   -> EpisodeWorkspace
@@ -17,12 +19,16 @@ The language model surface is intentionally narrow. API models can be added at t
 
 ## Hidden Test Boundary
 
-During an episode, `run_tests` only exposes public tests. Hidden tests are executed by the runner after the agent finishes or reaches `max_steps`. This keeps final reward separate from interaction feedback.
+During an episode, `run_tests` only exposes public tests. Hidden tests are stored outside the visible workspace, are filtered from file tools, and are executed by the runner after the agent finishes or reaches `max_steps`. This keeps final grading separate from interaction feedback.
+
+## Expert Trace Boundary
+
+Task JSON files do not contain expert patches. Synthetic expert patches are written as separate benchmark artifacts for scripted smoke tests and SFT data generation. ReAct/API agents should not depend on these artifacts.
 
 ## Training Story
 
 - SFT learns the scripted expert sequence.
-- PPO-style training writes a clipped-objective checkpoint over the same discrete action space.
-- GRPO-style training samples a group of trajectory variants and boosts actions from the best relative trajectory.
+- PPO-style training currently writes a lightweight checkpoint over the same discrete action space.
+- GRPO-style training currently writes a lightweight group-relative checkpoint.
 
-The default implementation is deliberately lightweight so it can run locally without a GPU. Installing `.[train]` enables PyTorch training artifacts in addition to JSON checkpoints.
+The default training implementation is deliberately lightweight so it can run locally without a GPU. It is a scaffold, not a complete PPO/GRPO rollout trainer yet. Installing `.[train]` enables PyTorch training artifacts in addition to JSON checkpoints.

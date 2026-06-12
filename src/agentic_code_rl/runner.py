@@ -29,7 +29,7 @@ def run_episode(
     runs_dir: Path,
     agent: Agent,
     run_id: str | None = None,
-    test_timeout_sec: int = 10,
+    test_timeout_sec: int = 30,
 ) -> Trajectory:
     task = load_task(task_path)
     run_root = runs_dir / (run_id or _default_run_id(task.id, agent.name))

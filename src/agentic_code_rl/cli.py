@@ -30,7 +30,7 @@ def main(argv: list[str] | None = None) -> None:
     run.add_argument("--agent", default="react", choices=["scripted", "react", "sft", "ppo", "grpo", "learned"])
     run.add_argument("--checkpoint", type=Path, default=None)
     run.add_argument("--run-id", default=None)
-    run.add_argument("--test-timeout-sec", type=int, default=10)
+    run.add_argument("--test-timeout-sec", type=int, default=30)
 
     train_sft_cmd = subparsers.add_parser("train-sft")
     train_sft_cmd.add_argument("--config", type=Path, default=None)

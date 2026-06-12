@@ -51,7 +51,7 @@ class ScriptedAgent:
         task = memory.task
         target_file = str(task.metadata.get("target_file", "src/buggy_lib.py"))
         function_name = str(task.metadata.get("function_name", ""))
-        expert_patch = dict(task.metadata.get("expert_patch", {}))
+        expert_patch = _expert_patch_for_task(task)
         if counts["list_files"] == 0:
             return AgentDecision("list_files", rationale="Inspect repository layout.")
         if counts["search_code"] == 0 and function_name:
@@ -169,7 +169,7 @@ class LearnedPolicyAgent:
         if action == "search_code":
             return AgentDecision(action, {"query": function_name or "def "}, rationale="Policy selected code search.")
         if action == "apply_patch":
-            patch = dict(task.metadata.get("expert_patch", {}))
+            patch = _expert_patch_for_task(task)
             return AgentDecision(action, patch, rationale="Policy selected patch action.")
         if action == "run_tests":
             return AgentDecision(action, {"scope": "public"}, rationale="Policy selected public test run.")
@@ -186,6 +186,15 @@ def create_agent(name: str, checkpoint: Path | None = None) -> Agent:
         ckpt = checkpoint or Path("runs") / "checkpoints" / f"{normalized}.json"
         return LearnedPolicyAgent(ckpt, name=normalized)
     raise ValueError(f"Unknown agent: {name}")
+
+
+def _expert_patch_for_task(task: TaskSpec) -> dict[str, str]:
+    source_case = str(task.metadata.get("source_case", ""))
+    if not source_case:
+        return {}
+    from .benchmark import expert_patch_for_case
+
+    return expert_patch_for_case(source_case)
 
 
 def save_policy_checkpoint(path: Path, action_scores: dict[str, float], metadata: dict[str, Any] | None = None) -> None:

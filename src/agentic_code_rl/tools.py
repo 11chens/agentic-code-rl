@@ -19,7 +19,7 @@ class ToolContext:
 
 
 class ToolLayer:
-    def __init__(self, context: ToolContext, test_timeout_sec: int = 10, allow_hidden_tests: bool = False):
+    def __init__(self, context: ToolContext, test_timeout_sec: int = 30, allow_hidden_tests: bool = False):
         self.context = context
         self.test_timeout_sec = test_timeout_sec
         self.allow_hidden_tests = allow_hidden_tests
@@ -108,12 +108,19 @@ class ToolLayer:
         return ToolResult("apply_patch", True, diff or "Patch applied with no textual diff", {"path": path})
 
     def run_tests(self, scope: str = "public") -> ToolResult:
-        if scope == "hidden":
+        if scope in {"hidden", "all"}:
             if not self.allow_hidden_tests:
-                return ToolResult("run_tests", False, "Hidden tests are reserved for final evaluation.", invalid=True)
-            tests = self.context.workspace.task.hidden_tests
-        elif scope == "all":
-            tests = [*self.context.workspace.task.public_tests, *self.context.workspace.task.hidden_tests]
+                return ToolResult(
+                    "run_tests",
+                    False,
+                    "Hidden and all-test runs are reserved for final evaluation.",
+                    invalid=True,
+                )
+            tests = (
+                self.context.workspace.task.hidden_tests
+                if scope == "hidden"
+                else [*self.context.workspace.task.public_tests, *self.context.workspace.task.hidden_tests]
+            )
         else:
             scope = "public"
             tests = self.context.workspace.task.public_tests

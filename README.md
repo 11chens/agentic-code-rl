@@ -1,6 +1,6 @@
 # Agentic Code RL
 
-Agentic Code RL is a compact research-style project for training and evaluating a tool-using code repair agent. Each episode copies a small buggy Python repository into an isolated workspace. The agent reads files, searches code, applies a patch, runs public tests, reflects on failures, and stops when it believes the task is solved. Hidden tests are reserved for final reward and evaluation.
+Agentic Code RL is a compact research-style project for evaluating and training tool-using code repair agents. The core harness is SWE-bench-style: each episode copies a small buggy Python repository into an isolated workspace, exposes only public tests to the agent, applies patches through guarded tools, and reserves hidden tests for final grading.
 
 The project is intentionally not embodied: it targets Agentic RL concepts that can be verified on a normal laptop.
 
@@ -9,8 +9,8 @@ For a cold-start handoff to another agent, read [docs/COLD_START_HANDOFF.md](doc
 ## What It Demonstrates
 
 - Agent architecture: planner, memory, tool calls, reflection, trajectory logging.
-- RL surfaces: SFT baseline, PPO-style clipped objective, GRPO-style group-relative objective.
-- Evaluation: public vs hidden tests, patch validity, tool cost, pass rate, runtime, trace artifacts.
+- RL surfaces: SFT baseline plus lightweight PPO/GRPO training scaffolds.
+- Evaluation harness: isolated workspaces, hidden-test grading, patch validity, tool cost, pass rate, runtime, trace artifacts.
 - Engineering: reproducible synthetic benchmark, CLI, JSON artifacts, tests, and reports.
 
 ## Quick Start
@@ -86,7 +86,7 @@ python -m agentic_code_rl report --run runs/<run_id>
 ```text
 src/agentic_code_rl/
   benchmark.py      synthetic code-repair task generation
-  environment.py    isolated workspaces and public/hidden test runner
+  environment.py    isolated workspaces and private hidden-test runner
   tools.py          guarded code-repair tool layer
   agents.py         scripted, ReAct fallback, and learned-policy agents
   runner.py         episode loop, memory, reward, trajectory artifacts
@@ -97,6 +97,6 @@ src/agentic_code_rl/
 
 ## Resume Bullets
 
-- Built an Agentic RL code-repair environment where agents solve Python bugs through guarded file search, patch generation, test execution, failure reflection, and trajectory logging.
-- Implemented public/hidden-test reward shaping and compared ReAct, SFT, PPO-style, and GRPO-style policies on pass rate, tool cost, invalid patch rate, and runtime.
-- Designed a reproducible synthetic benchmark with isolated workspaces, path guards, deterministic expert traces, and resumeable training artifacts.
+- Built a SWE-bench-style code-repair evaluation harness with isolated workspaces, guarded file search, controlled patch application, public-test interaction, private hidden-test grading, and trajectory logging.
+- Implemented public/hidden-test reward shaping and comparable ReAct/SFT/PPO-style/GRPO-style entrypoints over pass rate, tool cost, invalid patch rate, and runtime.
+- Designed a reproducible synthetic benchmark with path guards, hidden-test isolation, separate expert traces, and resumeable training artifacts.

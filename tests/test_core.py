@@ -19,10 +19,15 @@ def test_benchmark_create_writes_tasks_and_repos(tmp_path: Path) -> None:
     assert len(task_paths) == 3
     assert (tmp_path / "tasks" / "manifest.json").exists()
     assert (tmp_path / "repos" / "task_001" / "src" / "buggy_lib.py").exists()
+    assert (tmp_path / "repos" / "task_001" / "tests" / "test_public.py").exists()
+    assert not (tmp_path / "repos" / "task_001" / "tests" / "test_hidden.py").exists()
+    assert (tmp_path / "hidden_tests" / "task_001" / "tests" / "test_hidden.py").exists()
+    assert (tmp_path / "expert_patches" / "task_001" / "patch.json").exists()
     task = load_task(task_paths[0])
     assert task.public_tests == ["tests/test_public.py"]
     assert task.hidden_tests == ["tests/test_hidden.py"]
     assert task.metadata["target_file"] == "src/buggy_lib.py"
+    assert "expert_patch" not in task.metadata
 
 
 def test_workspace_path_guard_and_public_hidden_boundary(tmp_path: Path) -> None:
@@ -30,6 +35,9 @@ def test_workspace_path_guard_and_public_hidden_boundary(tmp_path: Path) -> None
     task = load_task(task_paths[0])
     workspace = EpisodeWorkspace.create(task, repos_dir=tmp_path / "repos", runs_dir=tmp_path / "run")
 
+    files = workspace.list_files()
+    assert "tests/test_public.py" in files
+    assert "tests/test_hidden.py" not in files
     assert workspace.run_tests(task.public_tests, scope="public").passed
     assert not workspace.run_tests(task.hidden_tests, scope="hidden").passed
     try:
@@ -42,7 +50,14 @@ def test_workspace_path_guard_and_public_hidden_boundary(tmp_path: Path) -> None
     tools = ToolLayer(ToolContext(workspace), allow_hidden_tests=False)
     result = tools.call("run_tests", {"scope": "hidden"})
     assert result.invalid
-    assert "Hidden tests" in result.output
+    assert "Hidden" in result.output
+    all_result = tools.call("run_tests", {"scope": "all"})
+    assert all_result.invalid
+
+    hidden_read = tools.call("read_file", {"path": "tests/test_hidden.py"})
+    assert hidden_read.invalid
+    search = tools.call("search_code", {"query": "is_prime"})
+    assert "test_hidden.py" not in search.output
 
 
 def test_scripted_episode_repairs_task_and_logs_trajectory(tmp_path: Path) -> None:
@@ -141,7 +156,7 @@ tasks_dir: {tmp_path / "tasks"}
 repos_dir: {tmp_path / "repos"}
 runs_dir: {tmp_path / "runs"}
 limit: 2
-test_timeout_sec: 10
+test_timeout_sec: 30
 """.strip(),
         encoding="utf-8",
     )

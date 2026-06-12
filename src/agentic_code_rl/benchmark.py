@@ -386,14 +386,22 @@ def test_large_and_empty_rotation():
 def create_benchmark(out: Path, repos_out: Path | None = None, count: int = 30, overwrite: bool = False) -> list[Path]:
     out = out.resolve()
     repos_out = (repos_out or out.parent / "repos").resolve()
+    hidden_out = (out.parent / "hidden_tests").resolve()
+    expert_out = (out.parent / "expert_patches").resolve()
     if out.exists() and any(out.iterdir()) and not overwrite:
         raise FileExistsError(f"{out} is not empty; pass overwrite=True to replace generated tasks")
     if repos_out.exists() and overwrite:
         shutil.rmtree(repos_out)
+    if hidden_out.exists() and overwrite:
+        shutil.rmtree(hidden_out)
+    if expert_out.exists() and overwrite:
+        shutil.rmtree(expert_out)
     if out.exists() and overwrite:
         shutil.rmtree(out)
     out.mkdir(parents=True, exist_ok=True)
     repos_out.mkdir(parents=True, exist_ok=True)
+    hidden_out.mkdir(parents=True, exist_ok=True)
+    expert_out.mkdir(parents=True, exist_ok=True)
 
     task_paths: list[Path] = []
     for index in range(count):
@@ -401,7 +409,11 @@ def create_benchmark(out: Path, repos_out: Path | None = None, count: int = 30, 
         task_id = f"task_{index + 1:03d}"
         repo_name = task_id
         repo_dir = repos_out / repo_name
+        hidden_dir = hidden_out / repo_name
+        expert_dir = expert_out / repo_name
         _write_repo(repo_dir, task_id, case)
+        _write_hidden_tests(hidden_dir, case)
+        _write_expert_patch(expert_dir, case)
 
         task = TaskSpec(
             id=task_id,
@@ -414,11 +426,6 @@ def create_benchmark(out: Path, repos_out: Path | None = None, count: int = 30, 
             metadata={
                 "function_name": case.function_name,
                 "target_file": "src/buggy_lib.py",
-                "expert_patch": {
-                    "path": "src/buggy_lib.py",
-                    "find": _clean(case.buggy_source),
-                    "replace": _clean(case.fixed_source),
-                },
                 "source_case": case.slug,
             },
         )
@@ -430,6 +437,8 @@ def create_benchmark(out: Path, repos_out: Path | None = None, count: int = 30, 
         "task_count": len(task_paths),
         "tasks_dir": str(out),
         "repos_dir": str(repos_out),
+        "hidden_tests_dir": str(hidden_out),
+        "expert_patches_dir": str(expert_out),
         "default_agent": "scripted",
     }
     write_json(out / "manifest.json", manifest)
@@ -443,11 +452,35 @@ def _write_repo(repo_dir: Path, task_id: str, case: FunctionCase) -> None:
     (repo_dir / "tests").mkdir(parents=True, exist_ok=True)
     (repo_dir / "src" / "buggy_lib.py").write_text(_clean(case.buggy_source), encoding="utf-8")
     (repo_dir / "tests" / "test_public.py").write_text(_clean(case.public_tests), encoding="utf-8")
-    (repo_dir / "tests" / "test_hidden.py").write_text(_clean(case.hidden_tests), encoding="utf-8")
     (repo_dir / "README.md").write_text(
         f"# {task_id}\n\n{case.prompt}\n\nTarget function: `{case.function_name}`.\n",
         encoding="utf-8",
     )
+
+
+def _write_hidden_tests(hidden_dir: Path, case: FunctionCase) -> None:
+    if hidden_dir.exists():
+        shutil.rmtree(hidden_dir)
+    (hidden_dir / "tests").mkdir(parents=True, exist_ok=True)
+    (hidden_dir / "tests" / "test_hidden.py").write_text(_clean(case.hidden_tests), encoding="utf-8")
+
+
+def _write_expert_patch(expert_dir: Path, case: FunctionCase) -> None:
+    if expert_dir.exists():
+        shutil.rmtree(expert_dir)
+    patch = expert_patch_for_case(case.slug)
+    write_json(expert_dir / "patch.json", patch)
+
+
+def expert_patch_for_case(source_case: str) -> dict[str, str]:
+    for case in CASE_LIBRARY:
+        if case.slug == source_case:
+            return {
+                "path": "src/buggy_lib.py",
+                "find": _clean(case.buggy_source),
+                "replace": _clean(case.fixed_source),
+            }
+    return {}
 
 
 def _clean(text: str) -> str:

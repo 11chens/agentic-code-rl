@@ -1,6 +1,6 @@
 # Cold Start Handoff: Agentic Code RL
 
-这份文档写给后续接手本项目的 agent。目标是在完全 cold start 的情况下，快速理解用户真实需求、原始项目计划、当前实现边界、可运行命令，以及下一步如何把项目升级成更高级的 Agentic RL harness。
+这份文档写给后续接手本项目的 agent。目标是在完全 cold start 的情况下，快速理解用户真实需求、原始项目计划、当前实现边界、可运行命令，以及下一步如何把项目升级成更可靠的代码修复评测框架。
 
 ## 1. 任务背景与用户目标
 
@@ -13,13 +13,13 @@
 - Python/PyTorch 工程能力、Git、可复现实验和评测报告。
 - 能讲清楚从已有 VLA 背景到上层长时序智能体决策的迁移关系。
 
-后续开发的总目标不是继续堆 demo，而是把本项目做成一个 **高级 harness**：任务、agent、训练、评测、报告都能统一接入、可复现、可比较、可扩展。
+后续开发的总目标不是继续堆 demo，而是把本项目做成一个 **SWE-bench-style code repair evaluation harness + tool-using agent runtime + training loop scaffold**。这里的 harness 只指隔离 workspace、受控工具执行、public/hidden 评测边界和可复现实验 artifacts，不把普通 MDP loop 或 PPO/GRPO 算法本身叫 harness。
 
 ## 2. 原始项目计划
 
 项目名称：`agentic-code-rl`。
 
-核心任务：面向 Python 代码修复任务，构建一个 tool-using code repair agent 的训练与评测 harness。
+核心任务：面向 Python 代码修复任务，构建一个 tool-using code repair agent 的评测框架，并预留 SFT/PPO/GRPO 训练入口。
 
 五层设计：
 
@@ -97,20 +97,20 @@ Git 初始提交：
 - `src/agentic_code_rl/benchmark.py`
   - 生成 synthetic Python bug tasks。
   - 默认 case library 覆盖 prime、factorial、median、binary search、unique、chunk、safe divide、anagram、CSV parse、rotation 等 bug 类型。
-  - 每个 task 生成 repo、public tests、hidden tests、metadata 和 expert patch。
+  - 每个 task 生成 visible repo、public tests、私有 hidden tests、metadata 和单独的 expert patch artifact。
 
 - `src/agentic_code_rl/environment.py`
   - `EpisodeWorkspace` 负责复制 repo 到隔离 workspace。
   - `resolve_path()` 拒绝绝对路径和路径逃逸。
-  - `run_tests()` 通过 pytest 子进程运行 public/hidden tests。
+  - `run_tests()` 通过 pytest 子进程运行 public tests；final evaluation 通过私有 hidden source 运行 hidden tests。
 
 - `src/agentic_code_rl/tools.py`
   - 实现 guarded tool layer。
-  - episode 内默认不允许 `run_tests(scope="hidden")`。
+  - episode 内默认不允许 `run_tests(scope="hidden")` 或 `run_tests(scope="all")`。
   - `apply_patch` 支持 find/replace 和 full content 写入。
 
 - `src/agentic_code_rl/agents.py`
-  - `ScriptedAgent`：使用 expert patch 跑通稳定专家轨迹。
+  - `ScriptedAgent`：使用 synthetic case library 中的 expert patch 跑通稳定专家轨迹；task JSON 不暴露答案。
   - `ReactAgent`：有 OpenAI-compatible chat completion 入口；没有 key 或失败时降级 scripted。
   - `LearnedPolicyAgent`：读取 JSON checkpoint 的 lightweight action score policy。
 
@@ -199,7 +199,8 @@ data/tasks/task_001.json
 data/tasks/manifest.json
 data/repos/task_001/src/buggy_lib.py
 data/repos/task_001/tests/test_public.py
-data/repos/task_001/tests/test_hidden.py
+data/hidden_tests/task_001/tests/test_hidden.py
+data/expert_patches/task_001/patch.json
 ```
 
 `data/` 被 `.gitignore` 忽略，不要提交。
@@ -284,7 +285,7 @@ Copy-Item .env.example .env
 
 当前代码读取环境变量，不自动加载 `.env`。如果需要 `.env` 自动加载，后续可加 `python-dotenv` 或在 shell 中显式设置环境变量。
 
-## 5. 高级 Harness 升级路线
+## 5. 升级路线
 
 ### P0：开发机真实训练路径
 
@@ -317,7 +318,7 @@ Copy-Item .env.example .env
 
 - `train-ppo` 不只是改 action scores，而是采样 episode、计算 advantage、更新 policy。
 - 支持 `resume_from` 恢复 checkpoint 和 optimizer state。
-- `eval --agent ppo` 能读取新 checkpoint 并通过统一 harness 评测。
+- `eval --agent ppo` 能读取新 checkpoint 并通过统一 evaluation harness 评测。
 
 ### P1：真实 GRPO-style group sampling
 
@@ -370,7 +371,7 @@ Copy-Item .env.example .env
 
 ### P2：Experiment registry 和对比报告
 
-目标：把 harness 从“能跑命令”升级成“能管理实验”。
+目标：把实验流程从“能跑命令”升级成“能管理实验”。
 
 推荐设计：
 
@@ -466,11 +467,11 @@ Copy-Item .env.example .env
 
 ## 7. 后续 agent 必须遵守的约束
 
-- 不要破坏 hidden-test 边界：episode 内工具只能跑 public tests，hidden tests 只在 final evaluation 中运行。
+- 不要破坏 hidden-test 边界：episode 内工具只能跑 public tests，也不能读/搜 hidden tests；hidden tests 只在 final evaluation 中运行。
 - 不要提交 `data/`、`runs/`、`.env` 或任何真实 API key。
-- 不要把 current scripted/expert path 当作最终算法成果；它只是 baseline、expert trace source 和 harness smoke path。
+- 不要把 current scripted/expert path 当作最终算法成果；它只是 baseline、expert trace source 和 smoke path。
 - 每次新增 agent 或算法，都必须能通过同一套 `eval` 和 `report` 输出可比较指标。
-- 优先提升 harness 的可复现性、可比较性、可训练性，再扩展更复杂模型。
+- 优先提升 evaluation harness 的可复现性、可比较性和安全边界，再扩展更复杂模型。
 - 任何训练升级都要保留无 torch 环境下可 inspect 的 JSON artifact。
 
 ## 8. 推荐给下一位 agent 的第一条指令
@@ -478,5 +479,5 @@ Copy-Item .env.example .env
 可以直接把下面这段作为 cold-start prompt：
 
 ```text
-你正在接手 D:\Vibethon\agentic-code-rl。请先阅读 README.md、docs/PROJECT_DESIGN.md、docs/COLD_START_HANDOFF.md。目标是把当前 Agentic Code RL 从 lightweight scaffold 升级为高级 harness。先不要大改架构；请运行 pytest 和 CLI smoke，确认当前状态，然后优先实现 P0：开发机真实 torch SFT checkpoint 加载与 LearnedPolicyAgent .pt 推理。必须保持 hidden tests 只用于 final evaluation，不要提交 data/、runs/、.env。
+你正在接手 D:\Vibethon\agentic-code-rl。请先阅读 README.md、docs/PROJECT_DESIGN.md、docs/COLD_START_HANDOFF.md。目标是把当前 Agentic Code RL 从 lightweight scaffold 升级为可靠的 SWE-bench-style code repair evaluation harness + training loop。先不要大改架构；请运行 pytest 和 CLI smoke，确认当前状态，然后优先实现 P0：开发机真实 torch SFT checkpoint 加载与 LearnedPolicyAgent .pt 推理。必须保持 hidden tests 只用于 final evaluation，不要提交 data/、runs/、.env。
 ```
