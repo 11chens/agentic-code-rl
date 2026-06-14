@@ -27,6 +27,11 @@ def _eval_report(run: Path, summary: dict[str, object]) -> str:
     rows = [
         ("Agent", summary.get("agent", "")),
         ("Task count", summary.get("task_count", 0)),
+        ("Checkpoint", summary.get("checkpoint", "")),
+        ("Training target", summary.get("training_target", "")),
+        ("Patch generation", summary.get("patch_generation", "")),
+        ("Scripted patch", summary.get("scripted_patch", "")),
+        ("Torch checkpoint", summary.get("torch_checkpoint", "")),
         ("pass@1", f"{float(summary.get('pass_at_1', 0.0)):.3f}"),
         ("Hidden pass rate", f"{float(summary.get('hidden_pass_rate', 0.0)):.3f}"),
         ("Public pass rate", f"{float(summary.get('public_pass_rate', 0.0)):.3f}"),

@@ -1,8 +1,29 @@
 tasks_dir: data/tasks
+repos_dir: data/repos
 output_dir: runs/training/grpo
 checkpoint: runs/checkpoints/grpo.json
 limit: 0
 epochs: 3
-learning_rate: 0.001
+learning_rate: 0.0001
+tasks_per_epoch: 30
+update_epochs: 2
+minibatch_size: 128
 group_size: 4
+clip_range: 0.2
+entropy_coef: 0.01
+temperature: 1.0
+epsilon: 0.1
+test_timeout_sec: 30
+device: cuda
 resume_from: runs/checkpoints/ppo.json
+
+model:
+  vocab_size: 8192
+  task_text_len: 128
+  observation_text_len: 256
+  max_steps: 16
+  d_model: 512
+  num_layers: 6
+  num_heads: 8
+  ffn_dim: 2048
+  dropout: 0.1

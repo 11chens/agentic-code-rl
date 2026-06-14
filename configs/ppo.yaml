@@ -1,8 +1,31 @@
 tasks_dir: data/tasks
+repos_dir: data/repos
 output_dir: runs/training/ppo
 checkpoint: runs/checkpoints/ppo.json
 limit: 0
-epochs: 3
-learning_rate: 0.001
+epochs: 10
+learning_rate: 0.0003
+rollout_tasks_per_epoch: 30
+ppo_update_epochs: 4
+minibatch_size: 128
+gamma: 0.99
+gae_lambda: 0.95
 clip_range: 0.2
+value_coef: 0.5
+entropy_coef: 0.01
+temperature: 1.0
+epsilon: 0.05
+test_timeout_sec: 30
+device: cuda
 resume_from: runs/checkpoints/sft.json
+
+model:
+  vocab_size: 8192
+  task_text_len: 128
+  observation_text_len: 256
+  max_steps: 16
+  d_model: 512
+  num_layers: 6
+  num_heads: 8
+  ffn_dim: 2048
+  dropout: 0.1

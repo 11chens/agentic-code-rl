@@ -8,7 +8,7 @@ import shutil
 from .agents import create_agent
 from .config import load_config
 from .runner import run_episode
-from .schemas import Trajectory, write_json
+from .schemas import Trajectory, read_json, write_json
 
 
 def evaluate(config_path: Path | None, agent_name: str, checkpoint: Path | None = None) -> Path:
@@ -46,6 +46,7 @@ def evaluate(config_path: Path | None, agent_name: str, checkpoint: Path | None 
     summary["agent"] = agent_name
     summary["run_id"] = run_id
     summary["task_count"] = len(trajectories)
+    summary.update(_checkpoint_summary(agent_name, checkpoint))
     write_json(eval_root / "eval_summary.json", summary)
     _update_latest(runs_dir, eval_root)
     return eval_root
@@ -105,3 +106,24 @@ def _update_latest(runs_dir: Path, eval_root: Path) -> None:
         else:
             latest.unlink()
     shutil.copytree(eval_root, latest)
+
+
+def _checkpoint_summary(agent_name: str, checkpoint: Path | None) -> dict[str, object]:
+    if checkpoint is None and agent_name in {"sft", "ppo", "grpo", "learned"}:
+        checkpoint = Path("runs") / "checkpoints" / f"{agent_name}.json"
+    if checkpoint is None or not checkpoint.exists() or checkpoint.suffix != ".json":
+        return {}
+    try:
+        data = read_json(checkpoint)
+    except Exception:
+        return {"checkpoint": str(checkpoint)}
+    metadata = data.get("metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    return {
+        "checkpoint": str(checkpoint),
+        "training_target": data.get("training_target") or metadata.get("training_target"),
+        "patch_generation": data.get("patch_generation") or metadata.get("patch_generation"),
+        "scripted_patch": data.get("scripted_patch", metadata.get("scripted_patch")),
+        "torch_checkpoint": data.get("torch_checkpoint") or metadata.get("torch_checkpoint"),
+    }

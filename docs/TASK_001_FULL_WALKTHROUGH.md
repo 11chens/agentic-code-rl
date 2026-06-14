@@ -9,7 +9,7 @@
 - agent 每一步为什么选择那个 tool。
 - tool 怎么影响 workspace。
 - reward 为什么最后是 `1.74`。
-- 当前哪些部分属于 SWE-bench-style evaluation harness，哪些只是 agent runtime / training scaffold。
+- 当前哪些部分属于 SWE-bench-style evaluation harness，哪些属于 agent runtime / tool-policy training。
 - hidden-test 边界和 expert patch 边界是如何被隔离的。
 
 ## 1. 任务本体：task_001.json 是什么

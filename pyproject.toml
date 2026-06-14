@@ -15,6 +15,7 @@ llm = [
   "openai>=1.40",
 ]
 train = [
+  "numpy>=1.26",
   "torch>=2.2",
 ]
 dev = [

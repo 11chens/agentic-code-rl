@@ -61,6 +61,7 @@ class AgentDecision:
     tool_input: dict[str, Any] = field(default_factory=dict)
     rationale: str = ""
     policy_logprob: float | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

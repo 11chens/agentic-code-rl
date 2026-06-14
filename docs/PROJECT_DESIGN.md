@@ -27,8 +27,10 @@ Task JSON files do not contain expert patches. Synthetic expert patches are writ
 
 ## Training Story
 
-- SFT learns the scripted expert sequence.
-- PPO-style training currently writes a lightweight checkpoint over the same discrete action space.
-- GRPO-style training currently writes a lightweight group-relative checkpoint.
+- SFT learns the scripted expert tool sequence.
+- PPO runs rollout training over the same discrete tool-action space with a clipped objective.
+- GRPO runs same-task group-relative rollout training over tool actions.
 
-The default training implementation is deliberately lightweight so it can run locally without a GPU. It is a scaffold, not a complete PPO/GRPO rollout trainer yet. Installing `.[train]` enables PyTorch training artifacts in addition to JSON checkpoints.
+The default trainable model is a compact Transformer encoder, not an LLM. It outputs action logits and a scalar value estimate; it does not generate patch text. `apply_patch` still receives patch payloads from the synthetic expert patch provider.
+
+Training writes both readable JSON metadata and PyTorch `.pt` checkpoints when `torch` is installed. The JSON fallback path is kept only so the CLI remains inspectable in non-training environments.

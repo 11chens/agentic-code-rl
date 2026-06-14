@@ -386,11 +386,11 @@ assert trajectory.final_reward < 0.5
 
 ## 9. 例子五：训练、评测、报告怎么串起来
 
-### 9.1 SFT/PPO/GRPO-style checkpoint
+### 9.1 SFT/PPO/GRPO training
 
 命令：
 
-```powershell
+```bash
 python -m agentic_code_rl train-sft --config configs/sft.yaml
 python -m agentic_code_rl train-ppo --config configs/ppo.yaml
 python -m agentic_code_rl train-grpo --config configs/grpo.yaml
@@ -405,22 +405,25 @@ src/agentic_code_rl/cli.py
   train-grpo -> training.py:train_grpo()
 ```
 
-当前训练模块做的是 scaffold：
+当前训练模块训练的是 Transformer tool policy：
 
-- `train_sft()` 根据 scripted expert sequence 统计动作，写 JSON checkpoint；有 torch 时额外训练小 MLP `.pt`。
-- `train_ppo()` 在 action scores 上加 PPO-style metadata，不是真正 rollout PPO。
-- `train_grpo()` 用一组手写 partial rewards 计算 group advantage，不是真正 group rollout GRPO。
+- `train_sft()` 从 scripted expert trajectory 采集决策点，用交叉熵训练 policy warm start。
+- `train_ppo()` 用当前 policy 采样 episode，按 reward 计算 advantage，并用 clipped PPO objective 更新。
+- `train_grpo()` 对同一 task 采样一组 trajectory，用组内相对 reward 更新 policy。
 
 输出：
 
 ```text
 runs/checkpoints/sft.json
+runs/checkpoints/sft.pt
 runs/checkpoints/ppo.json
+runs/checkpoints/ppo.pt
 runs/checkpoints/grpo.json
+runs/checkpoints/grpo.pt
 runs/training/*/replay_buffer.json
 ```
 
-`LearnedPolicyAgent` 读取 JSON checkpoint：
+`LearnedPolicyAgent` 优先读取 `.pt` checkpoint；JSON checkpoint 保留 metadata 和 fallback action scores：
 
 ```text
 src/agentic_code_rl/agents.py
@@ -428,10 +431,14 @@ src/agentic_code_rl/agents.py
   LearnedPolicyAgent.decide()
 ```
 
-它根据 `action_scores` 选择下一步工具：
+`.pt` 路径会把当前 `TaskSpec + Memory` 编码成 policy batch，然后用网络输出 action logits：
 
-```python
-action = max(valid_actions, key=lambda item: self.action_scores.get(item, 0.0))
+```text
+TaskSpec + trajectory prefix
+  -> PolicyFeatureEncoder
+  -> TrajectoryTransformerPolicy
+  -> masked logits [7]
+  -> AgentDecision(action, logprob, entropy)
 ```
 
 ### 9.2 Eval
@@ -528,8 +535,9 @@ flowchart LR
 5. `agents.py`：理解 agent 怎么选动作。
 6. `runner.py`：理解完整 episode。
 7. `evaluation.py` 和 `reporting.py`：理解评测。
-8. `training.py`：理解当前训练 scaffold 和后续要补什么。
-9. `tests/test_core.py`：看系统约束如何被测试覆盖。
+8. `policy.py`：理解 tool policy 的输入编码和 Transformer 网络。
+9. `training.py`：理解 SFT/PPO/GRPO 如何采集 rollout 并更新 policy。
+10. `tests/test_core.py`：看系统约束如何被测试覆盖。
 
 ## 12. 当前实现边界
 
@@ -545,15 +553,15 @@ flowchart LR
 - optional ReAct LLM planner入口
 - trajectory logging
 - eval/report
-- SFT/PPO/GRPO-style checkpoint scaffold
+- Transformer tool policy
+- SFT/PPO/GRPO training
+- learned `.pt` checkpoint inference
 - pytest 覆盖核心边界
 
 尚未真正实现：
 
 - 强 LLM patch generation 闭环
-- 真实 PPO rollout training
-- 真实 GRPO group rollout training
-- learned `.pt` checkpoint inference
+- patch generator 训练
 - failure classifier
 - experiment registry
 - multi-run comparison report
@@ -563,8 +571,7 @@ flowchart LR
 按学习和项目价值排序：
 
 1. 给 `ReactAgent` 增加真实 patch generation，并记录 `fallback_used`。
-2. 增加 `failure_type` 字段和 failure classifier。
-3. 把 `LearnedPolicyAgent` 改成可加载 `.pt` 的小 policy。
-4. 实现真实 PPO rollout：采样 episode、算 advantage、更新 policy。
-5. 实现真实 GRPO group rollout：同一 task 采样 K 条轨迹并做组内相对 reward。
-6. 增加 experiment registry 和多 agent 对比报告。
+2. 训练 patch generator，逐步替换 expert patch provider。
+3. 增加 `failure_type` 字段和 failure classifier。
+4. 增加 experiment registry 和多 agent 对比报告。
+5. 扩展 synthetic benchmark 难度和任务数量。

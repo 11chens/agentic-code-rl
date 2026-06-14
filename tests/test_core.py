@@ -2,10 +2,20 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agentic_code_rl.agents import AgentDecision, ScriptedAgent
+import pytest
+
+from agentic_code_rl.agents import AgentDecision, LearnedPolicyAgent, Memory, ScriptedAgent
 from agentic_code_rl.benchmark import create_benchmark
 from agentic_code_rl.environment import EpisodeWorkspace, WorkspaceError
 from agentic_code_rl.evaluation import evaluate
+from agentic_code_rl.policy import (
+    ACTIONS,
+    PolicyConfig,
+    PolicyFeatureEncoder,
+    TrajectoryTransformerPolicy,
+    save_torch_policy_checkpoint,
+    torch_available,
+)
 from agentic_code_rl.reporting import write_report
 from agentic_code_rl.runner import run_episode
 from agentic_code_rl.schemas import load_task, read_json
@@ -144,7 +154,10 @@ epochs: 1
     assert sft_checkpoint.exists()
     assert ppo_checkpoint.exists()
     assert (tmp_path / "training" / "sft" / "replay_buffer.json").exists()
-    assert read_json(ppo_checkpoint)["metadata"]["algorithm"] == "ppo"
+    ppo_payload = read_json(ppo_checkpoint)
+    assert ppo_payload["metadata"]["algorithm"] == "ppo"
+    assert ppo_payload["training_target"] == "tool_policy"
+    assert ppo_payload["patch_generation"] == "expert_patch_provider"
 
 
 def test_eval_and_report(tmp_path: Path) -> None:
@@ -169,3 +182,70 @@ test_timeout_sec: 30
     assert summary["pass_at_1"] == 1.0
     assert report.exists()
     assert "Evaluation Report" in report.read_text(encoding="utf-8")
+
+
+def test_policy_encoder_shapes_and_action_mask(tmp_path: Path) -> None:
+    task_paths = create_benchmark(tmp_path / "tasks", count=1)
+    task = load_task(task_paths[0])
+    encoder = PolicyFeatureEncoder(PolicyConfig(max_steps=12, d_model=64, num_layers=1, num_heads=4, ffn_dim=128))
+
+    encoded = encoder.encode(task, [])
+
+    assert len(encoded.task_tokens) == 128
+    assert len(encoded.observation_tokens) == 256
+    assert len(encoded.history_actions) == 12
+    assert len(encoded.history_statuses) == 12
+    assert len(encoded.history_numeric_features) == 12
+    assert len(encoded.action_mask) == len(ACTIONS)
+    assert not encoded.action_mask[ACTIONS.index("inspect_failure")]
+    assert not encoded.action_mask[ACTIONS.index("finish")]
+
+
+@pytest.mark.skipif(not torch_available(), reason="torch is not installed")
+def test_transformer_policy_forward_shapes(tmp_path: Path) -> None:
+    task_paths = create_benchmark(tmp_path / "tasks", count=1)
+    task = load_task(task_paths[0])
+    encoder = PolicyFeatureEncoder(
+        PolicyConfig(max_steps=12, d_model=64, num_layers=1, num_heads=4, ffn_dim=128, vocab_size=512)
+    )
+    model = TrajectoryTransformerPolicy(
+        encoder.config,
+        global_feature_dim=encoder.global_feature_dim,
+        step_feature_dim=encoder.step_feature_dim,
+        num_actions=len(ACTIONS),
+    )
+    batch = encoder.to_batch([encoder.encode(task, [])], device="cpu")
+
+    logits, value = model(batch)
+
+    assert tuple(logits.shape) == (1, len(ACTIONS))
+    assert tuple(value.shape) == (1,)
+
+
+@pytest.mark.skipif(not torch_available(), reason="torch is not installed")
+def test_learned_policy_agent_loads_torch_checkpoint(tmp_path: Path) -> None:
+    task_paths = create_benchmark(tmp_path / "tasks", count=1)
+    task = load_task(task_paths[0])
+    encoder = PolicyFeatureEncoder(
+        PolicyConfig(max_steps=12, d_model=64, num_layers=1, num_heads=4, ffn_dim=128, vocab_size=512)
+    )
+    model = TrajectoryTransformerPolicy(
+        encoder.config,
+        global_feature_dim=encoder.global_feature_dim,
+        step_feature_dim=encoder.step_feature_dim,
+        num_actions=len(ACTIONS),
+    )
+    checkpoint = tmp_path / "policy.pt"
+    save_torch_policy_checkpoint(
+        checkpoint,
+        model,
+        encoder,
+        metadata={"algorithm": "unit", "training_target": "tool_policy", "scripted_patch": True},
+    )
+    agent = LearnedPolicyAgent(checkpoint, deterministic=True, epsilon=0.0, device="cpu")
+
+    decision = agent.decide(Memory(task))
+
+    assert decision.action in ACTIONS
+    assert decision.policy_logprob is not None
+    assert "policy_value" in decision.metadata

@@ -1,7 +1,24 @@
 tasks_dir: data/tasks
+repos_dir: data/repos
 output_dir: runs/training/sft
 checkpoint: runs/checkpoints/sft.json
 limit: 0
 epochs: 3
-learning_rate: 0.001
+learning_rate: 0.0003
+minibatch_size: 128
+value_coef: 0.1
+gamma: 0.99
+test_timeout_sec: 30
+device: cuda
 resume_from: null
+
+model:
+  vocab_size: 8192
+  task_text_len: 128
+  observation_text_len: 256
+  max_steps: 16
+  d_model: 512
+  num_layers: 6
+  num_heads: 8
+  ffn_dim: 2048
+  dropout: 0.1

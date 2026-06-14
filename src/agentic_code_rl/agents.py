@@ -129,18 +129,36 @@ class ReactAgent:
 
 
 class LearnedPolicyAgent:
-    def __init__(self, checkpoint: Path, name: str = "learned", epsilon: float = 0.05):
+    def __init__(
+        self,
+        checkpoint: Path,
+        name: str = "learned",
+        epsilon: float = 0.05,
+        temperature: float = 1.0,
+        deterministic: bool = True,
+        device: str | None = None,
+    ):
         self.name = name
         self.checkpoint = checkpoint
         self.epsilon = epsilon
+        self.temperature = temperature
+        self.deterministic = deterministic
         self.fallback = ScriptedAgent()
-        data = read_json(checkpoint) if checkpoint.exists() else {}
+        data = read_json(checkpoint) if checkpoint.exists() and checkpoint.suffix != ".pt" else {}
         self.action_scores: dict[str, float] = {
             action: float(data.get("action_scores", {}).get(action, 0.0)) for action in ACTIONS
         }
         self.scripted_patch = bool(data.get("scripted_patch", True))
+        self.torch_model = None
+        self.torch_encoder = None
+        self.torch_device = device
+        self.torch_checkpoint = self._resolve_torch_checkpoint(checkpoint, data)
+        if self.torch_checkpoint is not None:
+            self._load_torch_policy(self.torch_checkpoint, device=device)
 
     def decide(self, memory: Memory) -> AgentDecision:
+        if self.torch_model is not None and self.torch_encoder is not None:
+            return self._torch_decide(memory)
         if self.scripted_patch:
             scripted = self.fallback.decide(memory)
             if scripted.action == "apply_patch":
@@ -175,6 +193,66 @@ class LearnedPolicyAgent:
             return AgentDecision(action, {"scope": "public"}, rationale="Policy selected public test run.")
         return AgentDecision(action, rationale="Policy selected action.")
 
+    def _resolve_torch_checkpoint(self, checkpoint: Path, data: dict[str, Any]) -> Path | None:
+        candidates: list[Path] = []
+        if checkpoint.suffix == ".pt":
+            candidates.append(checkpoint)
+        torch_checkpoint = data.get("torch_checkpoint") or data.get("metadata", {}).get("torch_checkpoint")
+        if torch_checkpoint:
+            candidates.append(Path(str(torch_checkpoint)))
+        if checkpoint.suffix != ".pt":
+            candidates.append(checkpoint.with_suffix(".pt"))
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _load_torch_policy(self, checkpoint: Path, device: str | None = None) -> None:
+        try:
+            from .policy import default_device, load_torch_policy_checkpoint, torch_available
+
+            if not torch_available():
+                return
+            selected_device = device or default_device()
+            model, encoder, _payload = load_torch_policy_checkpoint(checkpoint, selected_device)
+            model.eval()
+            self.torch_model = model
+            self.torch_encoder = encoder
+            self.torch_device = selected_device
+        except Exception:
+            self.torch_model = None
+            self.torch_encoder = None
+
+    def _torch_decide(self, memory: Memory) -> AgentDecision:
+        from .policy import ACTION_TO_ID, choose_action_from_logits, tool_input_for_action
+        import torch
+
+        encoded = self.torch_encoder.encode(memory.task, memory.steps, memory.observation())
+        batch = self.torch_encoder.to_batch([encoded], device=self.torch_device)
+        with torch.no_grad():
+            logits, value = self.torch_model(batch)
+        action_id, logprob, entropy = choose_action_from_logits(
+            logits,
+            deterministic=self.deterministic,
+            temperature=self.temperature,
+            epsilon=self.epsilon if not self.deterministic else 0.0,
+        )
+        action = ACTIONS[action_id]
+        return AgentDecision(
+            action,
+            tool_input_for_action(memory.task, action),
+            rationale="Torch policy selected action.",
+            policy_logprob=logprob,
+            metadata={
+                "policy_value": float(value.squeeze(0).detach().cpu().item()),
+                "policy_entropy": entropy,
+                "action_mask": encoded.action_mask,
+                "checkpoint_path": str(self.torch_checkpoint),
+                "temperature": self.temperature,
+                "action_id": ACTION_TO_ID[action],
+            },
+        )
+
 
 def create_agent(name: str, checkpoint: Path | None = None) -> Agent:
     normalized = name.lower()
@@ -198,10 +276,14 @@ def _expert_patch_for_task(task: TaskSpec) -> dict[str, str]:
 
 
 def save_policy_checkpoint(path: Path, action_scores: dict[str, float], metadata: dict[str, Any] | None = None) -> None:
+    metadata = metadata or {}
     payload = {
         "action_scores": {action: float(action_scores.get(action, 0.0)) for action in ACTIONS},
-        "scripted_patch": True,
-        "metadata": metadata or {},
+        "scripted_patch": bool(metadata.get("scripted_patch", True)),
+        "training_target": metadata.get("training_target", "tool_policy"),
+        "patch_generation": metadata.get("patch_generation", "expert_patch_provider"),
+        "torch_checkpoint": metadata.get("torch_checkpoint"),
+        "metadata": metadata,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

@@ -57,7 +57,7 @@ def run_episode(
             reward_delta=reward_delta,
             policy_logprob=decision.policy_logprob,
             rationale=decision.rationale,
-            metadata={"ok": result.ok, **result.metadata},
+            metadata={"ok": result.ok, **result.metadata, **decision.metadata},
         )
         memory.steps.append(step)
         if decision.action == "finish":
