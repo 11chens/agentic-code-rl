@@ -514,7 +514,7 @@ Tool input is rule-generated:
 list_files      -> {}
 read_file       -> {"path": target_file}
 search_code     -> {"query": function_name}
-apply_patch     -> expert patch provider for now
+apply_patch     -> selected patch candidate payload
 run_tests       -> {"scope": "public"}
 inspect_failure -> {}
 finish          -> {}

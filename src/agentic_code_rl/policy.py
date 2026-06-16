@@ -7,6 +7,12 @@ import hashlib
 import random
 import re
 
+from .patch_candidates import (
+    PATCH_CANDIDATE_FEATURES,
+    PatchCandidateProvider,
+    candidate_feature_vector,
+    candidate_text,
+)
 from .schemas import ACTIONS, TaskSpec, TrajectoryStep
 
 try:  # Keep the package importable without the train extra.
@@ -69,12 +75,15 @@ class PolicyConfig:
     vocab_size: int = 8192
     task_text_len: int = 128
     observation_text_len: int = 256
+    patch_text_len: int = 384
     max_steps: int = 16
+    max_patch_candidates: int = 6
     d_model: int = 512
     num_layers: int = 6
     num_heads: int = 8
     ffn_dim: int = 2048
     dropout: float = 0.1
+    patch_candidates_dir: str = str(Path("data") / "patch_candidates")
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "PolicyConfig":
@@ -83,12 +92,15 @@ class PolicyConfig:
             vocab_size=int(data.get("vocab_size", 8192)),
             task_text_len=int(data.get("task_text_len", 128)),
             observation_text_len=int(data.get("observation_text_len", 256)),
+            patch_text_len=int(data.get("patch_text_len", 384)),
             max_steps=int(data.get("max_steps", 16)),
+            max_patch_candidates=int(data.get("max_patch_candidates", 6)),
             d_model=int(data.get("d_model", 512)),
             num_layers=int(data.get("num_layers", 6)),
             num_heads=int(data.get("num_heads", 8)),
             ffn_dim=int(data.get("ffn_dim", 2048)),
             dropout=float(data.get("dropout", 0.1)),
+            patch_candidates_dir=str(data.get("patch_candidates_dir", str(Path("data") / "patch_candidates"))),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -96,12 +108,15 @@ class PolicyConfig:
             "vocab_size": self.vocab_size,
             "task_text_len": self.task_text_len,
             "observation_text_len": self.observation_text_len,
+            "patch_text_len": self.patch_text_len,
             "max_steps": self.max_steps,
+            "max_patch_candidates": self.max_patch_candidates,
             "d_model": self.d_model,
             "num_layers": self.num_layers,
             "num_heads": self.num_heads,
             "ffn_dim": self.ffn_dim,
             "dropout": self.dropout,
+            "patch_candidates_dir": self.patch_candidates_dir,
         }
 
 
@@ -110,6 +125,10 @@ class EncodedPolicyInput:
     task_tokens: list[int]
     observation_tokens: list[int]
     global_features: list[float]
+    candidate_tokens: list[list[int]]
+    candidate_features: list[list[float]]
+    candidate_mask: list[bool]
+    candidate_ids: list[str]
     history_actions: list[int]
     history_statuses: list[int]
     history_positions: list[int]
@@ -122,10 +141,16 @@ class EncodedPolicyInput:
 class PolicyFeatureEncoder:
     config: PolicyConfig = field(default_factory=PolicyConfig)
     tokenizer: SimpleTextTokenizer | None = None
+    candidate_provider: PatchCandidateProvider | None = None
 
     def __post_init__(self) -> None:
         if self.tokenizer is None:
             self.tokenizer = SimpleTextTokenizer(vocab_size=self.config.vocab_size)
+        if self.candidate_provider is None:
+            self.candidate_provider = PatchCandidateProvider(
+                candidates_dir=self.config.patch_candidates_dir,
+                max_candidates=self.config.max_patch_candidates,
+            )
 
     @property
     def global_feature_dim(self) -> int:
@@ -134,6 +159,10 @@ class PolicyFeatureEncoder:
     @property
     def step_feature_dim(self) -> int:
         return len(self.feature_schema()["step_features"])
+
+    @property
+    def candidate_feature_dim(self) -> int:
+        return len(self.feature_schema()["candidate_features"])
 
     def feature_schema(self) -> dict[str, Any]:
         return {
@@ -170,6 +199,7 @@ class PolicyFeatureEncoder:
                 "passed_count_norm",
                 "patch_count_seen_norm",
             ],
+            "candidate_features": PATCH_CANDIDATE_FEATURES,
         }
 
     def encode(
@@ -180,6 +210,22 @@ class PolicyFeatureEncoder:
     ) -> EncodedPolicyInput:
         task_text = _task_text(task)
         observation_text = observation if observation is not None else _observation_from_steps(task, steps)
+        candidates = self.candidate_provider.candidates_for_policy(task) if self.candidate_provider is not None else []
+        candidate_tokens: list[list[int]] = []
+        candidate_features: list[list[float]] = []
+        candidate_mask = [False] * self.config.max_patch_candidates
+        candidate_ids: list[str] = []
+        for index in range(self.config.max_patch_candidates):
+            if index < len(candidates):
+                candidate = candidates[index]
+                candidate_tokens.append(self.tokenizer.encode(candidate_text(candidate), self.config.patch_text_len))
+                candidate_features.append(candidate_feature_vector(candidate))
+                candidate_mask[index] = True
+                candidate_ids.append(candidate.id)
+            else:
+                candidate_tokens.append([self.tokenizer.pad_id] * self.config.patch_text_len)
+                candidate_features.append([0.0] * self.candidate_feature_dim)
+                candidate_ids.append("")
         max_steps = self.config.max_steps
         clipped_steps = steps[-max_steps:]
         counts = {action: 0 for action in ACTIONS}
@@ -260,6 +306,10 @@ class PolicyFeatureEncoder:
             task_tokens=self.tokenizer.encode(task_text, self.config.task_text_len),
             observation_tokens=self.tokenizer.encode(observation_text, self.config.observation_text_len),
             global_features=global_features,
+            candidate_tokens=candidate_tokens,
+            candidate_features=candidate_features,
+            candidate_mask=candidate_mask,
+            candidate_ids=candidate_ids,
             history_actions=history_actions,
             history_statuses=history_statuses,
             history_positions=history_positions,
@@ -279,6 +329,15 @@ class PolicyFeatureEncoder:
             ),
             "global_features": torch.tensor(
                 [item.global_features for item in encoded], dtype=torch.float32, device=target_device
+            ),
+            "candidate_tokens": torch.tensor(
+                [item.candidate_tokens for item in encoded], dtype=torch.long, device=target_device
+            ),
+            "candidate_features": torch.tensor(
+                [item.candidate_features for item in encoded], dtype=torch.float32, device=target_device
+            ),
+            "candidate_mask": torch.tensor(
+                [item.candidate_mask for item in encoded], dtype=torch.bool, device=target_device
             ),
             "history_actions": torch.tensor(
                 [item.history_actions for item in encoded], dtype=torch.long, device=target_device
@@ -307,12 +366,14 @@ if nn is not None:
             config: PolicyConfig,
             global_feature_dim: int,
             step_feature_dim: int,
+            candidate_feature_dim: int = len(PATCH_CANDIDATE_FEATURES),
             num_actions: int = len(ACTIONS),
         ) -> None:
             super().__init__()
             self.config = config
             self.global_feature_dim = global_feature_dim
             self.step_feature_dim = step_feature_dim
+            self.candidate_feature_dim = candidate_feature_dim
             self.num_actions = num_actions
             self.text_embedding = nn.Embedding(config.vocab_size, config.d_model, padding_idx=0)
             self.action_embedding = nn.Embedding(num_actions + 1, config.d_model)
@@ -320,6 +381,7 @@ if nn is not None:
             self.position_embedding = nn.Embedding(config.max_steps + 8, config.d_model)
             self.global_proj = nn.Linear(global_feature_dim, config.d_model)
             self.step_numeric_proj = nn.Linear(step_feature_dim, config.d_model)
+            self.candidate_feature_proj = nn.Linear(candidate_feature_dim, config.d_model)
             self.decision_token = nn.Parameter(torch.zeros(1, 1, config.d_model))
             layer = nn.TransformerEncoderLayer(
                 d_model=config.d_model,
@@ -331,13 +393,22 @@ if nn is not None:
             )
             self.transformer = nn.TransformerEncoder(layer, num_layers=config.num_layers)
             self.policy_head = nn.Linear(config.d_model, num_actions)
+            self.patch_rank_head = nn.Sequential(
+                nn.Linear(config.d_model * 2, config.d_model),
+                nn.GELU(),
+                nn.Linear(config.d_model, 1),
+            )
             self.value_head = nn.Linear(config.d_model, 1)
             nn.init.normal_(self.decision_token, mean=0.0, std=0.02)
 
-        def forward(self, batch: dict[str, Any]) -> tuple[Any, Any]:
+        def forward(self, batch: dict[str, Any]) -> tuple[Any, Any, Any]:
             task_token = self._pool_text(batch["task_tokens"])
             observation_token = self._pool_text(batch["observation_tokens"])
             global_token = self.global_proj(batch["global_features"]).unsqueeze(1)
+            candidate_hidden = (
+                self._pool_candidate_text(batch["candidate_tokens"])
+                + self.candidate_feature_proj(batch["candidate_features"])
+            )
             step_tokens = (
                 self.action_embedding(batch["history_actions"])
                 + self.status_embedding(batch["history_statuses"])
@@ -355,8 +426,12 @@ if nn is not None:
             logits = self.policy_head(decision_hidden)
             action_mask = batch["action_mask"]
             masked_logits = logits.masked_fill(~action_mask, -1e9)
+            expanded_decision = decision_hidden.unsqueeze(1).expand(-1, candidate_hidden.shape[1], -1)
+            patch_inputs = torch.cat([expanded_decision, candidate_hidden], dim=-1)
+            patch_logits = self.patch_rank_head(patch_inputs).squeeze(-1)
+            patch_logits = patch_logits.masked_fill(~batch["candidate_mask"], -1e9)
             value = self.value_head(decision_hidden).squeeze(-1)
-            return masked_logits, value
+            return masked_logits, patch_logits, value
 
         def _pool_text(self, token_ids: Any) -> Any:
             embeddings = self.text_embedding(token_ids)
@@ -364,6 +439,12 @@ if nn is not None:
             masked = embeddings * mask
             denom = mask.sum(dim=1).clamp_min(1)
             return (masked.sum(dim=1) / denom).unsqueeze(1)
+
+        def _pool_candidate_text(self, token_ids: Any) -> Any:
+            batch_size, candidate_count, text_len = token_ids.shape
+            flattened = token_ids.reshape(batch_size * candidate_count, text_len)
+            pooled = self._pool_text(flattened).squeeze(1)
+            return pooled.reshape(batch_size, candidate_count, self.config.d_model)
 
 else:
 
@@ -419,9 +500,14 @@ def load_torch_policy_checkpoint(path: Path, device: str | None = None) -> tuple
         config,
         global_feature_dim=encoder.global_feature_dim,
         step_feature_dim=encoder.step_feature_dim,
+        candidate_feature_dim=encoder.candidate_feature_dim,
         num_actions=len(ACTIONS),
     )
-    model.load_state_dict(payload["model_state_dict"])
+    load_result = model.load_state_dict(payload["model_state_dict"], strict=False)
+    payload["load_warnings"] = {
+        "missing_keys": list(load_result.missing_keys),
+        "unexpected_keys": list(load_result.unexpected_keys),
+    }
     model.to(torch.device(device or "cpu"))
     return model, encoder, payload
 
@@ -443,18 +529,24 @@ def action_mask_for_steps(task: TaskSpec, steps: list[TrajectoryStep]) -> list[b
     return [mask[action] for action in ACTIONS]
 
 
-def tool_input_for_action(task: TaskSpec, action: str) -> dict[str, Any]:
+def tool_input_for_action(
+    task: TaskSpec,
+    action: str,
+    candidate_id: str | None = None,
+    candidate_provider: PatchCandidateProvider | None = None,
+) -> dict[str, Any]:
     if action == "read_file":
         return {"path": str(task.metadata.get("target_file", "src/buggy_lib.py"))}
     if action == "search_code":
         return {"query": str(task.metadata.get("function_name", "")) or "def "}
     if action == "apply_patch":
-        source_case = str(task.metadata.get("source_case", ""))
-        if not source_case:
-            return {}
-        from .benchmark import expert_patch_for_case
-
-        return expert_patch_for_case(source_case)
+        provider = candidate_provider or PatchCandidateProvider()
+        if candidate_id is not None:
+            return provider.payload(task, candidate_id)
+        oracle_payload = provider.oracle_payload(task)
+        if oracle_payload:
+            return oracle_payload
+        return {}
     if action == "run_tests":
         return {"scope": "public"}
     return {}
@@ -480,6 +572,31 @@ def choose_action_from_logits(
     logprob = float(dist.log_prob(action_tensor).detach().cpu().item())
     entropy = float(dist.entropy().detach().cpu().item())
     return action_id, logprob, entropy
+
+
+def choose_candidate_from_logits(
+    logits: Any,
+    deterministic: bool,
+    temperature: float = 1.0,
+    epsilon: float = 0.0,
+) -> tuple[int | None, float, float]:
+    if torch is None:
+        raise RuntimeError("PyTorch is required to sample patch candidates")
+    squeezed = logits.squeeze(0)
+    valid = torch.nonzero(squeezed > -1e8, as_tuple=False).flatten().tolist()
+    if not valid:
+        return None, 0.0, 0.0
+    dist = torch.distributions.Categorical(logits=squeezed / max(temperature, 1e-6))
+    if epsilon > 0.0 and random.random() < epsilon:
+        candidate_index = int(random.choice(valid))
+    else:
+        candidate_index = int(torch.argmax(squeezed).item()) if deterministic else int(dist.sample().item())
+        if candidate_index not in valid:
+            candidate_index = int(valid[0])
+    candidate_tensor = torch.tensor(candidate_index, device=squeezed.device)
+    logprob = float(dist.log_prob(candidate_tensor).detach().cpu().item())
+    entropy = float(dist.entropy().detach().cpu().item())
+    return candidate_index, logprob, entropy
 
 
 def _task_text(task: TaskSpec) -> str:

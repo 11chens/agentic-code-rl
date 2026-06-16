@@ -5,6 +5,7 @@ from pathlib import Path
 from textwrap import dedent
 import shutil
 
+from .patch_candidates import write_patch_candidates
 from .schemas import TaskSpec, save_task, write_json
 
 
@@ -388,6 +389,7 @@ def create_benchmark(out: Path, repos_out: Path | None = None, count: int = 30, 
     repos_out = (repos_out or out.parent / "repos").resolve()
     hidden_out = (out.parent / "hidden_tests").resolve()
     expert_out = (out.parent / "expert_patches").resolve()
+    candidates_out = (out.parent / "patch_candidates").resolve()
     if out.exists() and any(out.iterdir()) and not overwrite:
         raise FileExistsError(f"{out} is not empty; pass overwrite=True to replace generated tasks")
     if repos_out.exists() and overwrite:
@@ -396,12 +398,15 @@ def create_benchmark(out: Path, repos_out: Path | None = None, count: int = 30, 
         shutil.rmtree(hidden_out)
     if expert_out.exists() and overwrite:
         shutil.rmtree(expert_out)
+    if candidates_out.exists() and overwrite:
+        shutil.rmtree(candidates_out)
     if out.exists() and overwrite:
         shutil.rmtree(out)
     out.mkdir(parents=True, exist_ok=True)
     repos_out.mkdir(parents=True, exist_ok=True)
     hidden_out.mkdir(parents=True, exist_ok=True)
     expert_out.mkdir(parents=True, exist_ok=True)
+    candidates_out.mkdir(parents=True, exist_ok=True)
 
     task_paths: list[Path] = []
     for index in range(count):
@@ -414,6 +419,7 @@ def create_benchmark(out: Path, repos_out: Path | None = None, count: int = 30, 
         _write_repo(repo_dir, task_id, case)
         _write_hidden_tests(hidden_dir, case)
         _write_expert_patch(expert_dir, case)
+        write_patch_candidates(candidates_out, task_id, case)
 
         task = TaskSpec(
             id=task_id,
@@ -439,6 +445,7 @@ def create_benchmark(out: Path, repos_out: Path | None = None, count: int = 30, 
         "repos_dir": str(repos_out),
         "hidden_tests_dir": str(hidden_out),
         "expert_patches_dir": str(expert_out),
+        "patch_candidates_dir": str(candidates_out),
         "default_agent": "scripted",
     }
     write_json(out / "manifest.json", manifest)

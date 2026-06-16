@@ -15,7 +15,7 @@ TaskSpec
   -> Public/Hidden Evaluation
 ```
 
-The language model surface is intentionally narrow. API models can be added at the `ReactAgent.decide()` boundary, while the trainable component remains a small discrete policy over tool actions.
+The language model surface is intentionally narrow. API models can be added at the `ReactAgent.decide()` boundary, while the trainable component remains a small hierarchical policy over tool actions and fixed patch candidates.
 
 ## Hidden Test Boundary
 
@@ -25,12 +25,14 @@ During an episode, `run_tests` only exposes public tests. Hidden tests are store
 
 Task JSON files do not contain expert patches. Synthetic expert patches are written as separate benchmark artifacts for scripted smoke tests and SFT data generation. ReAct/API agents should not depend on these artifacts.
 
+Patch candidates are also stored as separate artifacts under `data/patch_candidates/<task_id>/candidates.json`. Labels and `oracle_candidate_id` are only for SFT supervision, metrics, and debugging; the policy input only sees candidate id/source/payload text and structural features.
+
 ## Training Story
 
-- SFT learns the scripted expert tool sequence.
-- PPO runs rollout training over the same discrete tool-action space with a clipped objective.
-- GRPO runs same-task group-relative rollout training over tool actions.
+- SFT learns the scripted expert tool sequence and the oracle patch candidate on `apply_patch` steps.
+- PPO runs rollout training over the joint decision `log pi(action | state) + log pi(candidate | state, candidates)` with a clipped objective.
+- GRPO runs same-task group-relative rollout training over the same joint action/candidate decision.
 
-The default trainable model is a compact Transformer encoder, not an LLM. It outputs action logits and a scalar value estimate; it does not generate patch text. `apply_patch` still receives patch payloads from the synthetic expert patch provider.
+The default trainable model is a compact Transformer encoder, not an LLM. It outputs action logits, patch-candidate logits, and a scalar value estimate. It does not generate patch text; `apply_patch` receives the selected candidate payload.
 
 Training writes both readable JSON metadata and PyTorch `.pt` checkpoints when `torch` is installed. The JSON fallback path is kept only so the CLI remains inspectable in non-training environments.

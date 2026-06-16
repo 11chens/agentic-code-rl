@@ -761,6 +761,9 @@ batch = encoder.to_batch([encoded], device="cuda")
 ```text
 task_tokens:              LongTensor  [1, 128]
 observation_tokens:       LongTensor  [1, 256]
+candidate_tokens:         LongTensor  [1, K, L_patch]
+candidate_features:       FloatTensor [1, K, F_candidate]
+candidate_mask:           BoolTensor  [1, K]
 global_features:          FloatTensor [1, 25]
 history_actions:          LongTensor  [1, 16]
 history_statuses:         LongTensor  [1, 16]
@@ -775,6 +778,9 @@ action_mask:              BoolTensor  [1, 7]
 ```text
 task_tokens:              [128, 128]
 observation_tokens:       [128, 256]
+candidate_tokens:         [128, K, L_patch]
+candidate_features:       [128, K, F_candidate]
+candidate_mask:           [128, K]
 global_features:          [128, 25]
 history_actions:          [128, 16]
 history_statuses:         [128, 16]
@@ -789,7 +795,7 @@ action_mask:              [128, 7]
 forward 入口：
 
 ```python
-logits, value = model(batch)
+action_logits, patch_candidate_logits, value = model(batch)
 ```
 
 ### 17.1 文本 token
@@ -1030,7 +1036,7 @@ tool_input_for_action(task, "apply_patch")
 }
 ```
 
-从 synthetic expert patch provider 取到：
+从 patch candidate provider 取到被选中的 payload：
 
 ```json
 {

@@ -62,6 +62,8 @@ def summarize_trajectories(trajectories: list[Trajectory]) -> dict[str, float]:
             "avg_steps": 0.0,
             "invalid_patch_rate": 0.0,
             "syntax_error_rate": 0.0,
+            "patch_candidate_accuracy": 0.0,
+            "oracle_candidate_selection_rate": 0.0,
             "avg_api_cost_usd": 0.0,
             "avg_duration_sec": 0.0,
         }
@@ -75,6 +77,7 @@ def summarize_trajectories(trajectories: list[Trajectory]) -> dict[str, float]:
     syntax_errors = [1.0 if item.metrics.get("syntax_or_import_errors", 0) else 0.0 for item in trajectories]
     durations = [float(item.metrics.get("duration_sec", 0.0)) for item in trajectories]
     costs = [float(item.metrics.get("api_cost_usd", 0.0)) for item in trajectories]
+    patch_metrics = _patch_candidate_metrics(trajectories)
     return {
         "pass_at_1": mean(successes),
         "hidden_pass_rate": mean(successes),
@@ -83,8 +86,28 @@ def summarize_trajectories(trajectories: list[Trajectory]) -> dict[str, float]:
         "avg_steps": mean(tool_calls),
         "invalid_patch_rate": mean(invalid_patch),
         "syntax_error_rate": mean(syntax_errors),
+        "patch_candidate_accuracy": patch_metrics["patch_candidate_accuracy"],
+        "oracle_candidate_selection_rate": patch_metrics["oracle_candidate_selection_rate"],
         "avg_api_cost_usd": mean(costs),
         "avg_duration_sec": mean(durations),
+    }
+
+
+def _patch_candidate_metrics(trajectories: list[Trajectory]) -> dict[str, float]:
+    labeled_steps = []
+    oracle_steps = []
+    for trajectory in trajectories:
+        for step in trajectory.steps:
+            if step.action != "apply_patch":
+                continue
+            metadata = step.metadata
+            if metadata.get("patch_candidate_label") is not None or metadata.get("patch_candidate_is_correct") is not None:
+                labeled_steps.append(1.0 if metadata.get("patch_candidate_is_correct") else 0.0)
+            if metadata.get("patch_candidate_id") is not None:
+                oracle_steps.append(1.0 if metadata.get("patch_candidate_id") == "expert_correct" else 0.0)
+    return {
+        "patch_candidate_accuracy": mean(labeled_steps) if labeled_steps else 0.0,
+        "oracle_candidate_selection_rate": mean(oracle_steps) if oracle_steps else 0.0,
     }
 
 

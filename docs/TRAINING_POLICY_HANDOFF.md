@@ -1,13 +1,13 @@
 # Training Policy Handoff
 
-这份文档说明 `agentic-code-rl` 当前训练系统的设计和实现路线。当前已经把早期 lightweight checkpoint scaffold 升级成真实可训练的 **高层 tool-use policy**。本文先不考虑 patch 生成训练。
+这份文档说明 `agentic-code-rl` 当前训练系统的设计和实现路线。当前已经把早期 lightweight checkpoint scaffold 升级成真实可训练的 **高层 tool-use policy + patch candidate ranker**。本文仍不考虑自由形式 patch 生成训练。
 
 关键结论：
 
 ```text
-训练对象：Tool Policy / Planner
-不训练对象：Patch Generator / Code Editor
-推荐网络：Trajectory Transformer + policy head + value head
+训练对象：Tool Policy / Planner + Patch Candidate Ranker
+不训练对象：Free-form Patch Generator / Code Editor
+推荐网络：Trajectory Transformer + action head + patch rank head + value head
 训练顺序：SFT warm start -> PPO rollout fine-tune -> GRPO group rollout fine-tune
 ```
 
@@ -16,10 +16,12 @@
 
 ## 1. 训练边界
 
-当前阶段只训练：
+当前阶段训练层级策略：
 
 ```text
 pi(action | task, memory, tool history)
+if action == apply_patch:
+    pi(patch_candidate | task, memory, tool history, candidates)
 ```
 
 也就是训练 agent 在每一步选择哪个工具动作：
@@ -34,13 +36,13 @@ inspect_failure
 finish
 ```
 
-当前阶段不训练：
+当前阶段仍不训练自由形式代码生成器：
 
 ```text
 pi(patch | source code, bug prompt, test output, memory)
 ```
 
-所以 policy 的输出不是代码 diff，也不是 `find/replace` 字符串，而是 7 个 tool action 的概率分布。
+所以 policy 的输出不是任意代码 diff，也不是直接生成 `find/replace` 字符串，而是 7 个 tool action 的概率分布；在 `apply_patch` 步额外输出候选 patch 的概率分布。
 
 当 policy 输出：
 
@@ -48,7 +50,7 @@ pi(patch | source code, bug prompt, test output, memory)
 apply_patch
 ```
 
-第一版仍然由 expert patch provider 生成具体 patch payload：
+具体 patch payload 来自 `data/patch_candidates/<task_id>/candidates.json` 中被选中的候选：
 
 ```json
 {
@@ -61,12 +63,12 @@ apply_patch
 这必须在 artifact 中明确标记：
 
 ```text
-training_target: tool_policy
-patch_generation: expert_patch_provider
-scripted_patch: true
+training_target: tool_policy_with_patch_ranker
+patch_generation: patch_candidate_ranking
+scripted_patch: false
 ```
 
-这样做的原因是：高层 tool policy 是一个可控的离散 RL 问题，可以先把 SFT/PPO/GRPO 闭环做扎实；patch 生成是代码编辑生成问题，后续需要单独做 ReAct/API patch generator、patch SFT 或 DPO。
+这样做的原因是：高层 tool policy 和候选 ranking 是一个可控的层级离散 RL 问题，可以先把 SFT/PPO/GRPO 闭环做扎实；自由形式 patch 生成是代码编辑生成问题，后续需要单独做 ReAct/API patch generator、patch SFT 或 DPO。
 
 ## 2. 是不是 Transformer
 
@@ -76,7 +78,7 @@ scripted_patch: true
 Trajectory Transformer Policy
 ```
 
-但这里的 Transformer 不是大语言模型，也不是用来生成代码。它是一个中小型 transformer encoder，用来建模一次 episode 里的工具调用历史和当前状态。
+但这里的 Transformer 不是大语言模型，也不是用来生成任意代码。它是一个中小型 transformer encoder，用来建模一次 episode 里的工具调用历史、当前状态和候选 patch。
 
 推荐默认规模，适合 24G 4090：
 
@@ -140,6 +142,7 @@ Step history features
   -> TransformerEncoder
   -> decision token hidden state
   -> policy head -> action logits [7]
+  -> patch rank head -> patch candidate logits [K]
   -> value head -> scalar value
 ```
 
@@ -157,6 +160,7 @@ class TrajectoryTransformerPolicy(nn.Module):
         self.decision_token = nn.Parameter(torch.zeros(1, 1, config.d_model))
         self.transformer = nn.TransformerEncoder(...)
         self.policy_head = nn.Linear(config.d_model, num_actions)
+        self.patch_rank_head = nn.Linear(config.d_model * 2, 1)
         self.value_head = nn.Linear(config.d_model, 1)
 
     def forward(self, batch):
@@ -182,9 +186,10 @@ class TrajectoryTransformerPolicy(nn.Module):
         hidden = self.transformer(sequence, src_key_padding_mask=batch.padding_mask)
         decision_hidden = hidden[:, -1]
         logits = self.policy_head(decision_hidden)
+        patch_logits = score(decision_hidden, candidate_embeddings)
         value = self.value_head(decision_hidden).squeeze(-1)
         masked_logits = logits.masked_fill(~batch.action_mask, -1e9)
-        return masked_logits, value
+        return masked_logits, patch_logits, value
 ```
 
 ## 4. Policy 输入具体长什么样
@@ -445,7 +450,7 @@ policy 只输出 action，`tool_input` 用规则生成。
 list_files      -> {}
 read_file       -> {"path": task.metadata["target_file"] or "src/buggy_lib.py"}
 search_code     -> {"query": task.metadata["function_name"] or "def "}
-apply_patch     -> expert patch provider
+apply_patch     -> patch candidate provider
 run_tests       -> {"scope": "public"}
 inspect_failure -> {}
 finish          -> {}
@@ -509,7 +514,7 @@ inspect_failure: -inf
 finish:          -1.2
 ```
 
-softmax 后最高的是 `apply_patch`，agent 调用 expert patch provider，工具层执行 patch。
+softmax 后最高的是 `apply_patch`，agent 先在 patch candidates 中选一个 candidate id，再由工具层执行对应 payload。
 
 ## 8. 阶段 0：环境准备
 
@@ -837,22 +842,24 @@ memory + task
   -> PolicyFeatureEncoder
   -> PolicyBatch
   -> TrajectoryTransformerPolicy.forward()
-  -> masked logits
+  -> action logits + patch candidate logits
   -> sample or argmax action
-  -> build tool_input
-  -> AgentDecision(action, tool_input, policy_logprob)
+  -> if apply_patch: sample or argmax patch_candidate_id
+  -> build tool_input from selected candidate payload
+  -> AgentDecision(action, tool_input, joint policy_logprob)
 ```
 
 eval 默认用 deterministic：
 
 ```text
-argmax(masked_logits)
+argmax(action_logits), and argmax(patch_candidate_logits) if action is apply_patch
 ```
 
 PPO/GRPO rollout 默认用 stochastic：
 
 ```text
-Categorical(logits=masked_logits / temperature).sample()
+Categorical(logits=action_logits / temperature).sample()
+Categorical(logits=patch_candidate_logits / temperature).sample() on apply_patch
 epsilon-greedy optional
 ```
 
@@ -863,9 +870,9 @@ epsilon-greedy optional
 ```json
 {
   "algorithm": "ppo",
-  "training_target": "tool_policy",
-  "patch_generation": "expert_patch_provider",
-  "scripted_patch": true,
+  "training_target": "tool_policy_with_patch_ranker",
+  "patch_generation": "patch_candidate_ranking",
+  "scripted_patch": false,
   "torch_checkpoint": "runs/checkpoints/ppo.pt",
   "action_scores": {},
   "metrics": {}
@@ -885,9 +892,9 @@ epsilon-greedy optional
     "training_config": {...},
     "metadata": {
         "algorithm": "ppo",
-        "training_target": "tool_policy",
-        "patch_generation": "expert_patch_provider",
-        "scripted_patch": True,
+        "training_target": "tool_policy_with_patch_ranker",
+        "patch_generation": "patch_candidate_ranking",
+        "scripted_patch": False,
     },
 }
 ```
@@ -999,7 +1006,7 @@ runner 仍然应该是纯 evaluation/runtime 逻辑。torch 相关代码放在 p
 当 tool policy 稳定后，再进入 patch generator 路线：
 
 ```text
-1. ReAct/API patch generator 替代 expert patch provider
+1. ReAct/API patch generator 替代 patch candidate provider
 2. 收集 successful/failed patch traces
 3. 用 expert diffs 做 patch SFT
 4. 用 chosen/rejected patch 或 trajectory 做 DPO

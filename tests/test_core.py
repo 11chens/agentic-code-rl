@@ -8,7 +8,9 @@ from agentic_code_rl.agents import AgentDecision, LearnedPolicyAgent, Memory, Sc
 from agentic_code_rl.benchmark import create_benchmark
 from agentic_code_rl.environment import EpisodeWorkspace, WorkspaceError
 from agentic_code_rl.evaluation import evaluate
+from agentic_code_rl.patch_candidates import PatchCandidateProvider, candidate_text, policy_visible_candidate
 from agentic_code_rl.policy import (
+    ACTION_TO_ID,
     ACTIONS,
     PolicyConfig,
     PolicyFeatureEncoder,
@@ -20,7 +22,7 @@ from agentic_code_rl.reporting import write_report
 from agentic_code_rl.runner import run_episode
 from agentic_code_rl.schemas import load_task, read_json
 from agentic_code_rl.tools import ToolContext, ToolLayer
-from agentic_code_rl.training import train_ppo, train_sft
+from agentic_code_rl.training import train_grpo, train_ppo, train_sft
 
 
 def test_benchmark_create_writes_tasks_and_repos(tmp_path: Path) -> None:
@@ -33,11 +35,21 @@ def test_benchmark_create_writes_tasks_and_repos(tmp_path: Path) -> None:
     assert not (tmp_path / "repos" / "task_001" / "tests" / "test_hidden.py").exists()
     assert (tmp_path / "hidden_tests" / "task_001" / "tests" / "test_hidden.py").exists()
     assert (tmp_path / "expert_patches" / "task_001" / "patch.json").exists()
+    candidates_path = tmp_path / "patch_candidates" / "task_001" / "candidates.json"
+    assert candidates_path.exists()
+    candidates_payload = read_json(candidates_path)
+    assert sum(1 for item in candidates_payload["candidates"] if item.get("label") == "correct") == 1
     task = load_task(task_paths[0])
     assert task.public_tests == ["tests/test_public.py"]
     assert task.hidden_tests == ["tests/test_hidden.py"]
     assert task.metadata["target_file"] == "src/buggy_lib.py"
     assert "expert_patch" not in task.metadata
+
+    provider = PatchCandidateProvider(tmp_path / "patch_candidates")
+    first_candidate = provider.candidates_for_policy(task)[0]
+    assert provider.oracle_candidate_id(task) == "expert_correct"
+    assert "label" not in policy_visible_candidate(first_candidate)
+    assert "label" not in candidate_text(first_candidate)
 
 
 def test_workspace_path_guard_and_public_hidden_boundary(tmp_path: Path) -> None:
@@ -85,6 +97,8 @@ def test_scripted_episode_repairs_task_and_logs_trajectory(tmp_path: Path) -> No
     assert trajectory.hidden_passed
     assert trajectory.public_passed
     assert trajectory.final_reward > 1.0
+    patch_steps = [step for step in trajectory.steps if step.action == "apply_patch"]
+    assert patch_steps[0].metadata["patch_candidate_id"] == "expert_correct"
     assert (tmp_path / "runs" / "scripted-task" / "trajectory.json").exists()
 
 
@@ -132,6 +146,23 @@ output_dir: {tmp_path / "training" / "sft"}
 checkpoint: {tmp_path / "checkpoints" / "sft.json"}
 limit: 2
 epochs: 1
+minibatch_size: 8
+device: cpu
+patch_ranking:
+  candidates_dir: {tmp_path / "patch_candidates"}
+  max_candidates: 6
+  patch_text_len: 96
+  patch_loss_coef: 1.0
+model:
+  vocab_size: 512
+  task_text_len: 32
+  observation_text_len: 64
+  max_steps: 12
+  d_model: 64
+  num_layers: 1
+  num_heads: 4
+  ffn_dim: 128
+  dropout: 0.0
 """.strip(),
         encoding="utf-8",
     )
@@ -144,20 +175,63 @@ checkpoint: {tmp_path / "checkpoints" / "ppo.json"}
 resume_from: {tmp_path / "checkpoints" / "sft.json"}
 limit: 2
 epochs: 1
+rollout_tasks_per_epoch: 1
+ppo_update_epochs: 1
+minibatch_size: 8
+device: cpu
+patch_ranking:
+  candidates_dir: {tmp_path / "patch_candidates"}
+  max_candidates: 6
+  patch_text_len: 96
+model:
+  vocab_size: 512
+  task_text_len: 32
+  observation_text_len: 64
+  max_steps: 12
+  d_model: 64
+  num_layers: 1
+  num_heads: 4
+  ffn_dim: 128
+  dropout: 0.0
+""".strip(),
+        encoding="utf-8",
+    )
+    grpo_config = tmp_path / "grpo.yaml"
+    grpo_config.write_text(
+        f"""
+tasks_dir: {tmp_path / "tasks"}
+output_dir: {tmp_path / "training" / "grpo"}
+checkpoint: {tmp_path / "checkpoints" / "grpo.json"}
+resume_from: {tmp_path / "checkpoints" / "ppo.json"}
+limit: 1
+epochs: 1
+tasks_per_epoch: 1
+update_epochs: 1
+group_size: 2
+minibatch_size: 8
+device: cpu
+patch_ranking:
+  candidates_dir: {tmp_path / "patch_candidates"}
+  max_candidates: 6
+  patch_text_len: 96
 """.strip(),
         encoding="utf-8",
     )
 
     sft_checkpoint = train_sft(sft_config)
     ppo_checkpoint = train_ppo(ppo_config)
+    grpo_checkpoint = train_grpo(grpo_config)
 
     assert sft_checkpoint.exists()
     assert ppo_checkpoint.exists()
+    assert grpo_checkpoint.exists()
     assert (tmp_path / "training" / "sft" / "replay_buffer.json").exists()
     ppo_payload = read_json(ppo_checkpoint)
     assert ppo_payload["metadata"]["algorithm"] == "ppo"
-    assert ppo_payload["training_target"] == "tool_policy"
-    assert ppo_payload["patch_generation"] == "expert_patch_provider"
+    assert ppo_payload["training_target"] == "tool_policy_with_patch_ranker"
+    assert ppo_payload["patch_generation"] == "patch_candidate_ranking"
+    grpo_groups = read_json(tmp_path / "training" / "grpo" / "group_rollouts.json")
+    assert grpo_groups["groups"]
 
 
 def test_eval_and_report(tmp_path: Path) -> None:
@@ -187,12 +261,28 @@ test_timeout_sec: 30
 def test_policy_encoder_shapes_and_action_mask(tmp_path: Path) -> None:
     task_paths = create_benchmark(tmp_path / "tasks", count=1)
     task = load_task(task_paths[0])
-    encoder = PolicyFeatureEncoder(PolicyConfig(max_steps=12, d_model=64, num_layers=1, num_heads=4, ffn_dim=128))
+    encoder = PolicyFeatureEncoder(
+        PolicyConfig(
+            max_steps=12,
+            d_model=64,
+            num_layers=1,
+            num_heads=4,
+            ffn_dim=128,
+            patch_candidates_dir=str(tmp_path / "patch_candidates"),
+            max_patch_candidates=6,
+            patch_text_len=96,
+        )
+    )
 
     encoded = encoder.encode(task, [])
 
     assert len(encoded.task_tokens) == 128
     assert len(encoded.observation_tokens) == 256
+    assert len(encoded.candidate_tokens) == 6
+    assert len(encoded.candidate_tokens[0]) == 96
+    assert len(encoded.candidate_features) == 6
+    assert encoded.candidate_mask.count(True) == 5
+    assert "expert_correct" in encoded.candidate_ids
     assert len(encoded.history_actions) == 12
     assert len(encoded.history_statuses) == 12
     assert len(encoded.history_numeric_features) == 12
@@ -206,19 +296,31 @@ def test_transformer_policy_forward_shapes(tmp_path: Path) -> None:
     task_paths = create_benchmark(tmp_path / "tasks", count=1)
     task = load_task(task_paths[0])
     encoder = PolicyFeatureEncoder(
-        PolicyConfig(max_steps=12, d_model=64, num_layers=1, num_heads=4, ffn_dim=128, vocab_size=512)
+        PolicyConfig(
+            max_steps=12,
+            d_model=64,
+            num_layers=1,
+            num_heads=4,
+            ffn_dim=128,
+            vocab_size=512,
+            patch_candidates_dir=str(tmp_path / "patch_candidates"),
+            max_patch_candidates=6,
+            patch_text_len=96,
+        )
     )
     model = TrajectoryTransformerPolicy(
         encoder.config,
         global_feature_dim=encoder.global_feature_dim,
         step_feature_dim=encoder.step_feature_dim,
+        candidate_feature_dim=encoder.candidate_feature_dim,
         num_actions=len(ACTIONS),
     )
     batch = encoder.to_batch([encoder.encode(task, [])], device="cpu")
 
-    logits, value = model(batch)
+    action_logits, patch_logits, value = model(batch)
 
-    assert tuple(logits.shape) == (1, len(ACTIONS))
+    assert tuple(action_logits.shape) == (1, len(ACTIONS))
+    assert tuple(patch_logits.shape) == (1, 6)
     assert tuple(value.shape) == (1,)
 
 
@@ -227,25 +329,47 @@ def test_learned_policy_agent_loads_torch_checkpoint(tmp_path: Path) -> None:
     task_paths = create_benchmark(tmp_path / "tasks", count=1)
     task = load_task(task_paths[0])
     encoder = PolicyFeatureEncoder(
-        PolicyConfig(max_steps=12, d_model=64, num_layers=1, num_heads=4, ffn_dim=128, vocab_size=512)
+        PolicyConfig(
+            max_steps=12,
+            d_model=64,
+            num_layers=1,
+            num_heads=4,
+            ffn_dim=128,
+            vocab_size=512,
+            patch_candidates_dir=str(tmp_path / "patch_candidates"),
+            max_patch_candidates=6,
+            patch_text_len=96,
+        )
     )
     model = TrajectoryTransformerPolicy(
         encoder.config,
         global_feature_dim=encoder.global_feature_dim,
         step_feature_dim=encoder.step_feature_dim,
+        candidate_feature_dim=encoder.candidate_feature_dim,
         num_actions=len(ACTIONS),
     )
+    with torch.no_grad():
+        model.policy_head.weight.zero_()
+        model.policy_head.bias.fill_(-10.0)
+        model.policy_head.bias[ACTION_TO_ID["apply_patch"]] = 10.0
     checkpoint = tmp_path / "policy.pt"
     save_torch_policy_checkpoint(
         checkpoint,
         model,
         encoder,
-        metadata={"algorithm": "unit", "training_target": "tool_policy", "scripted_patch": True},
+        metadata={
+            "algorithm": "unit",
+            "training_target": "tool_policy_with_patch_ranker",
+            "patch_generation": "patch_candidate_ranking",
+            "scripted_patch": False,
+        },
     )
     agent = LearnedPolicyAgent(checkpoint, deterministic=True, epsilon=0.0, device="cpu")
 
     decision = agent.decide(Memory(task))
 
-    assert decision.action in ACTIONS
+    assert decision.action == "apply_patch"
     assert decision.policy_logprob is not None
     assert "policy_value" in decision.metadata
+    assert decision.metadata["patch_candidate_id"]
+    assert decision.tool_input["path"] == "src/buggy_lib.py"

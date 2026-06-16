@@ -38,6 +38,8 @@ def _eval_report(run: Path, summary: dict[str, object]) -> str:
         ("Avg tool calls", f"{float(summary.get('avg_tool_calls', 0.0)):.2f}"),
         ("Invalid patch rate", f"{float(summary.get('invalid_patch_rate', 0.0)):.3f}"),
         ("Syntax error rate", f"{float(summary.get('syntax_error_rate', 0.0)):.3f}"),
+        ("Patch candidate accuracy", f"{float(summary.get('patch_candidate_accuracy', 0.0)):.3f}"),
+        ("Oracle candidate selection rate", f"{float(summary.get('oracle_candidate_selection_rate', 0.0)):.3f}"),
         ("Avg duration sec", f"{float(summary.get('avg_duration_sec', 0.0)):.2f}"),
     ]
     table = "\n".join(f"| {name} | {value} |" for name, value in rows)

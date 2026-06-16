@@ -17,6 +17,7 @@ from .policy import (
     PolicyFeatureEncoder,
     TrajectoryTransformerPolicy,
     choose_action_from_logits,
+    choose_candidate_from_logits,
     default_device,
     load_torch_policy_checkpoint,
     save_torch_policy_checkpoint,
@@ -31,6 +32,8 @@ from .schemas import AgentDecision, TaskSpec, Trajectory, TrajectoryStep, load_t
 class TrainSample:
     encoded: Any
     action_id: int
+    patch_candidate_index: int | None
+    patch_candidate_id: str | None
     old_logprob: float
     value: float
     reward: float
@@ -65,25 +68,47 @@ class TorchRolloutAgent:
         batch = self.encoder.to_batch([encoded], device=self.device)
         self.model.eval()
         with torch.no_grad():
-            logits, value = self.model(batch)
+            action_logits, patch_logits, value = self.model(batch)
         action_id, logprob, entropy = choose_action_from_logits(
-            logits,
+            action_logits,
             deterministic=self.deterministic,
             temperature=self.temperature,
             epsilon=self.epsilon if not self.deterministic else 0.0,
         )
         action = ACTIONS[action_id]
+        patch_candidate_id: str | None = None
+        patch_logprob = 0.0
+        patch_entropy = 0.0
+        if action == "apply_patch":
+            candidate_index, patch_logprob, patch_entropy = choose_candidate_from_logits(
+                patch_logits,
+                deterministic=self.deterministic,
+                temperature=self.temperature,
+                epsilon=self.epsilon if not self.deterministic else 0.0,
+            )
+            if candidate_index is not None and candidate_index < len(encoded.candidate_ids):
+                patch_candidate_id = encoded.candidate_ids[candidate_index] or None
+        joint_logprob = logprob + patch_logprob
+        provider = self.encoder.candidate_provider
         return AgentDecision(
             action,
-            tool_input_for_action(memory.task, action),
+            tool_input_for_action(memory.task, action, patch_candidate_id, provider),
             rationale="Training policy rollout selected action.",
-            policy_logprob=logprob,
+            policy_logprob=joint_logprob,
             metadata={
                 "policy_value": float(value.squeeze(0).detach().cpu().item()),
-                "policy_entropy": entropy,
+                "policy_entropy": entropy + patch_entropy,
+                "action_logprob": logprob,
+                "patch_logprob": patch_logprob if action == "apply_patch" else None,
+                "joint_logprob": joint_logprob,
                 "action_mask": encoded.action_mask,
                 "temperature": self.temperature,
                 "action_id": action_id,
+                "patch_candidate_id": patch_candidate_id,
+                "patch_candidate_label": provider.label(memory.task, patch_candidate_id) if provider else None,
+                "patch_candidate_is_correct": (
+                    provider.label(memory.task, patch_candidate_id) == "correct" if provider and patch_candidate_id else None
+                ),
             },
         )
 
@@ -286,6 +311,7 @@ def _train_sft_torch(task_paths: list[Path], config: dict[str, Any], checkpoint:
         encoder.config,
         global_feature_dim=encoder.global_feature_dim,
         step_feature_dim=encoder.step_feature_dim,
+        candidate_feature_dim=encoder.candidate_feature_dim,
         num_actions=len(ACTIONS),
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=float(config.get("learning_rate", 3e-4)))
@@ -301,6 +327,7 @@ def _train_sft_torch(task_paths: list[Path], config: dict[str, Any], checkpoint:
     epochs = int(config.get("epochs", 3))
     batch_size = int(config.get("minibatch_size", 128))
     value_coef = float(config.get("value_coef", 0.1))
+    patch_loss_coef = _patch_ranking_config(config).get("patch_loss_coef", 1.0)
     model.train()
     last_loss = 0.0
     for _ in range(epochs):
@@ -309,10 +336,25 @@ def _train_sft_torch(task_paths: list[Path], config: dict[str, Any], checkpoint:
             batch = encoder.to_batch([sample.encoded for sample in chunk], device=device)
             actions = torch.tensor([sample.action_id for sample in chunk], dtype=torch.long, device=device)
             returns = torch.tensor([sample.ret for sample in chunk], dtype=torch.float32, device=device)
-            logits, values = model(batch)
-            policy_loss = F.cross_entropy(logits, actions)
+            action_logits, patch_logits, values = model(batch)
+            policy_loss = F.cross_entropy(action_logits, actions)
+            patch_rows = [
+                index
+                for index, sample in enumerate(chunk)
+                if sample.action_id == ACTION_TO_ID["apply_patch"] and sample.patch_candidate_index is not None
+            ]
+            if patch_rows:
+                row_tensor = torch.tensor(patch_rows, dtype=torch.long, device=device)
+                patch_targets = torch.tensor(
+                    [chunk[index].patch_candidate_index for index in patch_rows],
+                    dtype=torch.long,
+                    device=device,
+                )
+                patch_loss = F.cross_entropy(patch_logits.index_select(0, row_tensor), patch_targets)
+            else:
+                patch_loss = action_logits.sum() * 0.0
             value_loss = F.mse_loss(values, returns)
-            loss = policy_loss + value_coef * value_loss
+            loss = policy_loss + float(patch_loss_coef) * patch_loss + value_coef * value_loss
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(config.get("max_grad_norm", 1.0)))
@@ -456,11 +498,20 @@ def _samples_from_trajectory(
             continue
         prefix = trajectory.steps[:index]
         encoded = encoder.encode(task, prefix, step.observation)
+        patch_candidate_id = str(step.metadata.get("patch_candidate_id")) if step.metadata.get("patch_candidate_id") else None
+        patch_candidate_index = None
+        if patch_candidate_id:
+            try:
+                patch_candidate_index = encoded.candidate_ids.index(patch_candidate_id)
+            except ValueError:
+                patch_candidate_index = None
         advantage = override_advantage if override_advantage is not None else raw_advantages[index]
         samples.append(
             TrainSample(
                 encoded=encoded,
                 action_id=ACTION_TO_ID[step.action],
+                patch_candidate_index=patch_candidate_index,
+                patch_candidate_id=patch_candidate_id,
                 old_logprob=float(step.policy_logprob if step.policy_logprob is not None else 0.0),
                 value=values[index],
                 reward=rewards[index],
@@ -497,13 +548,28 @@ def _ppo_update(
         for chunk in _chunks(samples, batch_size):
             batch = encoder.to_batch([sample.encoded for sample in chunk], device=device)
             actions = torch.tensor([sample.action_id for sample in chunk], dtype=torch.long, device=device)
+            patch_indices = torch.tensor(
+                [sample.patch_candidate_index if sample.patch_candidate_index is not None else -1 for sample in chunk],
+                dtype=torch.long,
+                device=device,
+            )
             old_logprobs = torch.tensor([sample.old_logprob for sample in chunk], dtype=torch.float32, device=device)
             returns = torch.tensor([sample.ret for sample in chunk], dtype=torch.float32, device=device)
             advantages = torch.tensor([sample.advantage for sample in chunk], dtype=torch.float32, device=device)
-            logits, values = model(batch)
-            dist = torch.distributions.Categorical(logits=logits)
-            new_logprobs = dist.log_prob(actions)
-            entropy = dist.entropy().mean()
+            action_logits, patch_logits, values = model(batch)
+            action_dist = torch.distributions.Categorical(logits=action_logits)
+            action_logprobs = action_dist.log_prob(actions)
+            entropy = action_dist.entropy().mean()
+            patch_mask = (actions == ACTION_TO_ID["apply_patch"]) & (patch_indices >= 0)
+            patch_logprobs = torch.zeros_like(action_logprobs)
+            patch_entropy = torch.tensor(0.0, device=device)
+            if bool(patch_mask.any()):
+                patch_dist = torch.distributions.Categorical(logits=patch_logits[patch_mask])
+                selected_patch_indices = patch_indices[patch_mask]
+                patch_logprobs[patch_mask] = patch_dist.log_prob(selected_patch_indices)
+                patch_entropy = patch_dist.entropy().mean()
+                entropy = entropy + patch_entropy
+            new_logprobs = action_logprobs + patch_logprobs
             ratio = torch.exp(new_logprobs - old_logprobs)
             unclipped = ratio * advantages
             clipped = torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range) * advantages
@@ -521,6 +587,7 @@ def _ppo_update(
                     "policy_loss": float(policy_loss.detach().cpu().item()),
                     "value_loss": float(value_loss.detach().cpu().item()),
                     "entropy": float(entropy.detach().cpu().item()),
+                    "patch_entropy": float(patch_entropy.detach().cpu().item()),
                     "clip_fraction": float(clip_fraction.detach().cpu().item()),
                     "approx_kl": float(approx_kl.detach().cpu().item()),
                 }
@@ -550,12 +617,27 @@ def _grpo_update(
         for chunk in _chunks(samples, batch_size):
             batch = encoder.to_batch([sample.encoded for sample in chunk], device=device)
             actions = torch.tensor([sample.action_id for sample in chunk], dtype=torch.long, device=device)
+            patch_indices = torch.tensor(
+                [sample.patch_candidate_index if sample.patch_candidate_index is not None else -1 for sample in chunk],
+                dtype=torch.long,
+                device=device,
+            )
             old_logprobs = torch.tensor([sample.old_logprob for sample in chunk], dtype=torch.float32, device=device)
             advantages = torch.tensor([sample.advantage for sample in chunk], dtype=torch.float32, device=device)
-            logits, _values = model(batch)
-            dist = torch.distributions.Categorical(logits=logits)
-            new_logprobs = dist.log_prob(actions)
-            entropy = dist.entropy().mean()
+            action_logits, patch_logits, _values = model(batch)
+            action_dist = torch.distributions.Categorical(logits=action_logits)
+            action_logprobs = action_dist.log_prob(actions)
+            entropy = action_dist.entropy().mean()
+            patch_mask = (actions == ACTION_TO_ID["apply_patch"]) & (patch_indices >= 0)
+            patch_logprobs = torch.zeros_like(action_logprobs)
+            patch_entropy = torch.tensor(0.0, device=device)
+            if bool(patch_mask.any()):
+                patch_dist = torch.distributions.Categorical(logits=patch_logits[patch_mask])
+                selected_patch_indices = patch_indices[patch_mask]
+                patch_logprobs[patch_mask] = patch_dist.log_prob(selected_patch_indices)
+                patch_entropy = patch_dist.entropy().mean()
+                entropy = entropy + patch_entropy
+            new_logprobs = action_logprobs + patch_logprobs
             ratio = torch.exp(new_logprobs - old_logprobs)
             unclipped = ratio * advantages
             clipped = torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range) * advantages
@@ -571,6 +653,7 @@ def _grpo_update(
                 {
                     "policy_loss": float(policy_loss.detach().cpu().item()),
                     "entropy": float(entropy.detach().cpu().item()),
+                    "patch_entropy": float(patch_entropy.detach().cpu().item()),
                     "clip_fraction": float(clip_fraction.detach().cpu().item()),
                     "approx_kl": float(approx_kl.detach().cpu().item()),
                 }
@@ -594,6 +677,8 @@ def _training_config(config_path: Path | None, algorithm: str) -> dict[str, Any]
         "device": None,
     }
     config.update(load_config(config_path))
+    patch_config = _patch_ranking_config(config)
+    config["patch_ranking"] = patch_config
     if not config.get("repos_dir"):
         config["repos_dir"] = str(Path(config["tasks_dir"]).parent / "repos")
     Path(config["output_dir"]).mkdir(parents=True, exist_ok=True)
@@ -608,7 +693,34 @@ def _policy_config_from_config(config: dict[str, Any]) -> PolicyConfig:
     for key in ["vocab_size", "task_text_len", "observation_text_len", "max_steps", "d_model", "num_layers", "num_heads", "ffn_dim", "dropout"]:
         if key in config and key not in model_config:
             model_config[key] = config[key]
+    patch_config = _patch_ranking_config(config)
+    mapped_patch_config = {
+        "patch_text_len": patch_config.get("patch_text_len"),
+        "max_patch_candidates": patch_config.get("max_candidates"),
+        "patch_candidates_dir": patch_config.get("candidates_dir"),
+    }
+    for key, value in mapped_patch_config.items():
+        if key not in model_config and value is not None:
+            model_config[key] = value
     return PolicyConfig.from_dict(model_config)
+
+
+def _patch_ranking_config(config: dict[str, Any]) -> dict[str, Any]:
+    raw = config.get("patch_ranking", {})
+    patch_config = {
+        "enabled": True,
+        "candidates_dir": str(Path("data") / "patch_candidates"),
+        "max_candidates": 6,
+        "patch_text_len": 384,
+        "patch_loss_coef": 1.0,
+        "candidate_temperature": 1.0,
+        "candidate_epsilon": 0.1,
+    }
+    if isinstance(raw, dict):
+        patch_config.update(raw)
+    if isinstance(raw, dict) and "candidates_dir" not in raw and config.get("tasks_dir"):
+        patch_config["candidates_dir"] = str(Path(str(config["tasks_dir"])).parent / "patch_candidates")
+    return patch_config
 
 
 def _training_device(config: dict[str, Any]) -> str:
@@ -722,9 +834,39 @@ def _train_grpo_fallback(config: dict[str, Any], task_paths: list[Path], checkpo
     partial_rewards = [0.35, 0.15, -0.2][: max(group_size - 1, 0)]
     group = [scripted_reward, *partial_rewards]
     group_mean = sum(group) / len(group)
+    group_std = math.sqrt(sum((item - group_mean) ** 2 for item in group) / len(group))
     advantage = scripted_reward - group_mean
     for action in ["apply_patch", "run_tests", "finish"]:
         scores[action] += advantage / 10.0
+    groups = []
+    for task_path in task_paths:
+        task = load_task(task_path)
+        rollouts = []
+        for index, reward in enumerate(group):
+            selected_candidate = "expert_correct" if index == 0 else "wrong_logic"
+            selected_label = "correct" if index == 0 else "wrong_logic"
+            rollouts.append(
+                {
+                    "task_id": task.id,
+                    "agent": "grpo-fallback",
+                    "actions": ["list_files", "search_code", "read_file", "apply_patch", "run_tests", "finish"],
+                    "patch_candidate_ids": [None, None, None, selected_candidate, None, None],
+                    "patch_candidate_labels": [None, None, None, selected_label, None, None],
+                    "patch_candidate_correct": [None, None, None, selected_label == "correct", None, None],
+                    "final_reward": reward,
+                    "relative_advantage": (reward - group_mean) / (group_std + 1e-6),
+                    "winner": reward == max(group),
+                }
+            )
+        groups.append(
+            {
+                "task_id": task.id,
+                "group_id": f"fallback-{task.id}",
+                "mean_reward": group_mean,
+                "std_reward": group_std,
+                "rollouts": rollouts,
+            }
+        )
     metadata = _checkpoint_metadata(
         algorithm="grpo",
         tasks=len(task_paths),
@@ -737,6 +879,7 @@ def _train_grpo_fallback(config: dict[str, Any], task_paths: list[Path], checkpo
     )
     save_policy_checkpoint(checkpoint, scores, metadata)
     _write_replay_buffer(Path(config["output_dir"]) / "replay_buffer.json", task_paths)
+    write_json(Path(config["output_dir"]) / "group_rollouts.json", {"groups": groups})
     write_json(Path(config["output_dir"]) / "grpo_metrics.json", {"checkpoint": str(checkpoint), "action_scores": scores})
     return checkpoint
 
@@ -750,9 +893,9 @@ def _checkpoint_metadata(
 ) -> dict[str, Any]:
     metadata = {
         "algorithm": algorithm,
-        "training_target": "tool_policy",
-        "patch_generation": "expert_patch_provider",
-        "scripted_patch": True,
+        "training_target": "tool_policy_with_patch_ranker",
+        "patch_generation": "patch_candidate_ranking",
+        "scripted_patch": False,
         "torch_status": torch_status,
         "torch_checkpoint": torch_checkpoint,
         "tasks": tasks,
@@ -788,6 +931,7 @@ def _load_or_init_policy(config: dict[str, Any], device: str) -> tuple[Any, Poli
         encoder.config,
         global_feature_dim=encoder.global_feature_dim,
         step_feature_dim=encoder.step_feature_dim,
+        candidate_feature_dim=encoder.candidate_feature_dim,
         num_actions=len(ACTIONS),
     ).to(device)
     return model, encoder, "fresh"
@@ -856,6 +1000,9 @@ def _trajectory_artifact(trajectory: Trajectory) -> dict[str, Any]:
         "task_id": trajectory.task_id,
         "agent": trajectory.agent,
         "actions": [step.action for step in trajectory.steps],
+        "patch_candidate_ids": [step.metadata.get("patch_candidate_id") for step in trajectory.steps],
+        "patch_candidate_labels": [step.metadata.get("patch_candidate_label") for step in trajectory.steps],
+        "patch_candidate_correct": [step.metadata.get("patch_candidate_is_correct") for step in trajectory.steps],
         "old_logprobs": [step.policy_logprob for step in trajectory.steps],
         "reward_deltas": [step.reward_delta for step in trajectory.steps],
         "final_reward": trajectory.final_reward,

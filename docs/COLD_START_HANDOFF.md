@@ -16,15 +16,17 @@
 - guarded tool layer
 - public/hidden test 隔离
 - scripted / ReAct / learned-policy agent
-- SFT / PPO / GRPO tool-policy 训练入口
+- SFT / PPO / GRPO tool-policy + patch-ranker 训练入口
 - evaluation report 和 trajectory artifacts
 
 这里的 harness 指隔离 workspace、受控工具执行、public/hidden 评测边界和可复现实验 artifacts；普通 MDP loop、PPO/GRPO 算法本身不叫 harness。
 
-当前训练对象是高层 tool policy：
+当前训练对象是层级 policy：
 
 ```text
 pi(action | task, memory, tool history)
+if action == apply_patch:
+  pi(patch_candidate | task, memory, tool history, candidates)
 ```
 
 动作空间固定为：
@@ -33,7 +35,7 @@ pi(action | task, memory, tool history)
 list_files / read_file / search_code / apply_patch / run_tests / inspect_failure / finish
 ```
 
-当前不训练 patch generator。`apply_patch` 的具体 patch 内容仍来自 synthetic expert patch provider。
+当前不训练自由形式 patch generator。`apply_patch` 的具体 payload 来自 synthetic patch candidate artifact，learned policy 负责在候选中排名/选择。
 
 ## 2. 当前实现状态
 
@@ -41,7 +43,7 @@ list_files / read_file / search_code / apply_patch / run_tests / inspect_failure
 
 - `src/agentic_code_rl/benchmark.py`
   - 生成 synthetic Python bug tasks。
-  - 生成 visible repo、public tests、hidden tests、task JSON 和独立 expert patch artifact。
+  - 生成 visible repo、public tests、hidden tests、task JSON、独立 expert patch artifact 和 patch candidate artifact。
 
 - `src/agentic_code_rl/environment.py`
   - `EpisodeWorkspace` 复制 repo 到隔离 workspace。
@@ -53,7 +55,7 @@ list_files / read_file / search_code / apply_patch / run_tests / inspect_failure
   - episode 内默认不允许 `run_tests(scope="hidden")` 或 `run_tests(scope="all")`。
 
 - `src/agentic_code_rl/agents.py`
-  - `ScriptedAgent`：使用 expert patch artifact 跑通专家轨迹。
+  - `ScriptedAgent`：选择 `oracle_candidate_id` 跑通专家轨迹。
   - `ReactAgent`：OpenAI-compatible chat completion 入口；失败或无 key 时降级 scripted。
   - `LearnedPolicyAgent`：优先加载 `.pt` Transformer checkpoint；JSON checkpoint 作为 metadata/fallback。
 
@@ -61,7 +63,7 @@ list_files / read_file / search_code / apply_patch / run_tests / inspect_failure
   - `SimpleTextTokenizer`
   - `PolicyFeatureEncoder`
   - `TrajectoryTransformerPolicy`
-  - checkpoint save/load 和 action sampling helpers。
+  - checkpoint save/load、action sampling 和 patch-candidate sampling helpers。
 
 - `src/agentic_code_rl/training.py`
   - `train-sft`：从 scripted expert trajectories 做 supervised warm start。
@@ -80,7 +82,7 @@ list_files / read_file / search_code / apply_patch / run_tests / inspect_failure
 
 ## 3. 训练网络
 
-当前 learned policy 是 Trajectory Transformer，不是 LLM，也不生成代码。
+当前 learned policy 是 Trajectory Transformer，不是 LLM，也不生成任意代码 diff。
 
 默认配置：
 
@@ -102,6 +104,9 @@ device: cuda
 ```text
 task_tokens              LongTensor [B, 128]
 observation_tokens       LongTensor [B, 256]
+candidate_tokens         LongTensor [B, K, L_patch]
+candidate_features       FloatTensor [B, K, F_candidate]
+candidate_mask           BoolTensor [B, K]
 global_features          FloatTensor [B, 25]
 history_actions          LongTensor [B, 16]
 history_statuses         LongTensor [B, 16]
@@ -120,8 +125,9 @@ Transformer sequence：
 输出：
 
 ```text
-logits: [B, 7]
-value:  [B]
+action_logits:          [B, 7]
+patch_candidate_logits: [B, K]
+value:                  [B]
 ```
 
 详细说明：
@@ -247,7 +253,7 @@ hidden_pass_rate: 1.000
 public_pass_rate: 1.000
 ```
 
-注意：这个 100% 结果来自 synthetic tasks + expert patch provider。它证明 tool-policy 训练和评测闭环能跑通，不代表模型已经学会自主生成代码 patch。
+注意：这个 100% 结果来自 synthetic tasks + patch candidate ranking。它证明 tool-policy、candidate ranking 和评测闭环能跑通，不代表模型已经学会自由形式生成代码 patch。
 
 ## 7. 重要边界
 
@@ -257,11 +263,11 @@ public_pass_rate: 1.000
 - task JSON 不能包含 expert patch 内容。
 - `data/`、`runs/`、`.env`、本地 venv 不能提交。
 - 默认训练使用 GPU；CPU 只允许 debug。
-- 报告必须标明 `training_target: tool_policy` 和 `patch_generation: expert_patch_provider`。
+- 报告必须标明 `training_target: tool_policy_with_patch_ranker` 和 `patch_generation: patch_candidate_ranking`。
 
 当前尚未实现：
 
-- learned patch generator
+- learned free-form patch generator
 - 强 ReAct/API patch generation 闭环
 - failure classifier
 - experiment registry
@@ -272,7 +278,7 @@ public_pass_rate: 1.000
 
 优先级建议：
 
-1. 实现 patch generator 训练或 API patch generation，让 `apply_patch` 不再依赖 expert patch provider。
+1. 实现 patch generator 训练或 API patch generation，让 `apply_patch` 不再局限于 synthetic candidates。
 2. 给 `ReactAgent` 增加严格 JSON patch prompt，并记录 `fallback_used`。
 3. 增加 failure classification：`path_error`、`patch_no_match`、`syntax_error`、`public_test_fail`、`hidden_test_fail`、`timeout`、`premature_finish`、`tool_loop`。
 4. 增加 experiment registry 和多 run 对比报告。
@@ -284,5 +290,5 @@ public_pass_rate: 1.000
 可以直接把下面这段作为后续 agent 的启动 prompt：
 
 ```text
-你正在接手 /home/robot/Projects/agentic-code-rl。请先阅读 README.md、docs/PROJECT_DESIGN.md、docs/TRAINING_QUICKSTART.md、docs/POLICY_NETWORK_ARCHITECTURE.md、docs/POLICY_NETWORK_IO_WALKTHROUGH.md 和 docs/COLD_START_HANDOFF.md。当前已经实现 Transformer tool policy 的 SFT/PPO/GRPO 训练，并在 RTX 4090 上跑通。请先运行 pytest 和必要 CLI smoke，确认当前状态。必须保持 hidden tests 只用于 final evaluation，不要提交 data/、runs/、.env 或本地 venv。下一阶段优先减少对 expert patch provider 的依赖，推进真实 patch generation。
+你正在接手 /home/robot/Projects/agentic-code-rl。请先阅读 README.md、docs/PROJECT_DESIGN.md、docs/TRAINING_QUICKSTART.md、docs/POLICY_NETWORK_ARCHITECTURE.md、docs/POLICY_NETWORK_IO_WALKTHROUGH.md 和 docs/COLD_START_HANDOFF.md。当前已经实现 Transformer tool policy + patch candidate ranker 的 SFT/PPO/GRPO 训练，并在 RTX 4090 上跑通。请先运行 pytest 和必要 CLI smoke，确认当前状态。必须保持 hidden tests 只用于 final evaluation，不要提交 data/、runs/、.env 或本地 venv。下一阶段优先从 synthetic patch candidates 扩展到 API/learned patch generation。
 ```

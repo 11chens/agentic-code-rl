@@ -5,7 +5,7 @@
 当前训练对象是：
 
 ```text
-Trajectory Transformer tool policy
+Trajectory Transformer tool policy + patch candidate ranker
 ```
 
 它训练 agent 什么时候调用：
@@ -14,7 +14,7 @@ Trajectory Transformer tool policy
 list_files / read_file / search_code / apply_patch / run_tests / inspect_failure / finish
 ```
 
-当前不训练 patch generator。`apply_patch` 的具体 patch 内容仍来自 expert patch provider。
+当前不训练自由形式 patch generator。`apply_patch` 的具体 payload 来自 synthetic patch candidates，policy 在候选中排名和选择。
 
 ## 1. 环境要求
 
@@ -323,13 +323,14 @@ torch unavailable: ...
 ```text
 Tool Policy:
   什么时候读文件、搜索、patch、跑测试、结束
+  如果选择 apply_patch，则在候选 patch 中选择一个 payload
 ```
 
 当前没有训练：
 
 ```text
-Patch Generator:
+Free-form Patch Generator:
   具体生成什么代码 diff
 ```
 
-所以 `apply_patch` 目前仍然使用 expert patch provider。这个路径适合做 SFT smoke、tool-policy PPO/GRPO 闭环和 harness 验证；如果要做真正自主修 bug，下一阶段需要加入 patch generator。
+所以 `apply_patch` 目前仍然不自由生成代码，而是使用 patch candidate provider。这个路径适合做 SFT smoke、tool-policy PPO/GRPO 闭环和 harness 验证；如果要做真正自主修 bug，下一阶段需要加入 API/learned patch generator。

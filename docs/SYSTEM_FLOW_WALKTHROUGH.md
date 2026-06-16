@@ -571,7 +571,7 @@ flowchart LR
 按学习和项目价值排序：
 
 1. 给 `ReactAgent` 增加真实 patch generation，并记录 `fallback_used`。
-2. 训练 patch generator，逐步替换 expert patch provider。
+2. 训练 API/learned patch generator，逐步替换 synthetic patch candidates。
 3. 增加 `failure_type` 字段和 failure classifier。
 4. 增加 experiment registry 和多 agent 对比报告。
 5. 扩展 synthetic benchmark 难度和任务数量。

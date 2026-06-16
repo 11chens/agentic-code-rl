@@ -7,6 +7,7 @@ import json
 import os
 import random
 
+from .patch_candidates import PatchCandidateProvider
 from .schemas import ACTIONS, AgentDecision, TaskSpec, TrajectoryStep, read_json
 
 
@@ -51,15 +52,26 @@ class ScriptedAgent:
         task = memory.task
         target_file = str(task.metadata.get("target_file", "src/buggy_lib.py"))
         function_name = str(task.metadata.get("function_name", ""))
-        expert_patch = _expert_patch_for_task(task)
+        patch_provider = PatchCandidateProvider()
+        oracle_candidate_id = patch_provider.oracle_candidate_id(task)
+        oracle_patch = patch_provider.oracle_payload(task)
         if counts["list_files"] == 0:
             return AgentDecision("list_files", rationale="Inspect repository layout.")
         if counts["search_code"] == 0 and function_name:
             return AgentDecision("search_code", {"query": function_name}, rationale="Find the target function.")
         if counts["read_file"] == 0:
             return AgentDecision("read_file", {"path": target_file}, rationale="Read target source file.")
-        if counts["apply_patch"] == 0 and expert_patch:
-            return AgentDecision("apply_patch", expert_patch, rationale="Apply known expert repair.")
+        if counts["apply_patch"] == 0 and oracle_patch:
+            return AgentDecision(
+                "apply_patch",
+                oracle_patch,
+                rationale="Apply oracle patch candidate.",
+                metadata={
+                    "patch_candidate_id": oracle_candidate_id,
+                    "patch_candidate_label": patch_provider.label(task, oracle_candidate_id),
+                    "patch_candidate_is_correct": patch_provider.label(task, oracle_candidate_id) == "correct",
+                },
+            )
         if counts["run_tests"] == 0:
             return AgentDecision("run_tests", {"scope": "public"}, rationale="Verify public tests.")
         return AgentDecision("finish", rationale="Stop after verification.")
@@ -144,11 +156,12 @@ class LearnedPolicyAgent:
         self.temperature = temperature
         self.deterministic = deterministic
         self.fallback = ScriptedAgent()
+        self.patch_provider = PatchCandidateProvider()
         data = read_json(checkpoint) if checkpoint.exists() and checkpoint.suffix != ".pt" else {}
         self.action_scores: dict[str, float] = {
             action: float(data.get("action_scores", {}).get(action, 0.0)) for action in ACTIONS
         }
-        self.scripted_patch = bool(data.get("scripted_patch", True))
+        self.scripted_patch = bool(data.get("scripted_patch", False))
         self.torch_model = None
         self.torch_encoder = None
         self.torch_device = device
@@ -187,8 +200,18 @@ class LearnedPolicyAgent:
         if action == "search_code":
             return AgentDecision(action, {"query": function_name or "def "}, rationale="Policy selected code search.")
         if action == "apply_patch":
-            patch = _expert_patch_for_task(task)
-            return AgentDecision(action, patch, rationale="Policy selected patch action.")
+            candidate_id = self.patch_provider.oracle_candidate_id(task)
+            patch = self.patch_provider.payload(task, candidate_id)
+            return AgentDecision(
+                action,
+                patch,
+                rationale="Policy selected oracle patch candidate fallback.",
+                metadata={
+                    "patch_candidate_id": candidate_id,
+                    "patch_candidate_label": self.patch_provider.label(task, candidate_id),
+                    "patch_candidate_is_correct": self.patch_provider.label(task, candidate_id) == "correct",
+                },
+            )
         if action == "run_tests":
             return AgentDecision(action, {"scope": "public"}, rationale="Policy selected public test run.")
         return AgentDecision(action, rationale="Policy selected action.")
@@ -224,32 +247,54 @@ class LearnedPolicyAgent:
             self.torch_encoder = None
 
     def _torch_decide(self, memory: Memory) -> AgentDecision:
-        from .policy import ACTION_TO_ID, choose_action_from_logits, tool_input_for_action
+        from .policy import ACTION_TO_ID, choose_action_from_logits, choose_candidate_from_logits, tool_input_for_action
         import torch
 
         encoded = self.torch_encoder.encode(memory.task, memory.steps, memory.observation())
         batch = self.torch_encoder.to_batch([encoded], device=self.torch_device)
         with torch.no_grad():
-            logits, value = self.torch_model(batch)
+            action_logits, patch_logits, value = self.torch_model(batch)
         action_id, logprob, entropy = choose_action_from_logits(
-            logits,
+            action_logits,
             deterministic=self.deterministic,
             temperature=self.temperature,
             epsilon=self.epsilon if not self.deterministic else 0.0,
         )
         action = ACTIONS[action_id]
+        patch_candidate_id: str | None = None
+        patch_logprob = 0.0
+        patch_entropy = 0.0
+        if action == "apply_patch":
+            candidate_index, patch_logprob, patch_entropy = choose_candidate_from_logits(
+                patch_logits,
+                deterministic=self.deterministic,
+                temperature=self.temperature,
+                epsilon=self.epsilon if not self.deterministic else 0.0,
+            )
+            if candidate_index is not None and candidate_index < len(encoded.candidate_ids):
+                patch_candidate_id = encoded.candidate_ids[candidate_index] or None
+        provider = self.torch_encoder.candidate_provider or self.patch_provider
+        joint_logprob = logprob + patch_logprob
         return AgentDecision(
             action,
-            tool_input_for_action(memory.task, action),
+            tool_input_for_action(memory.task, action, patch_candidate_id, provider),
             rationale="Torch policy selected action.",
-            policy_logprob=logprob,
+            policy_logprob=joint_logprob,
             metadata={
                 "policy_value": float(value.squeeze(0).detach().cpu().item()),
-                "policy_entropy": entropy,
+                "policy_entropy": entropy + patch_entropy,
+                "action_logprob": logprob,
+                "patch_logprob": patch_logprob if action == "apply_patch" else None,
+                "joint_logprob": joint_logprob,
                 "action_mask": encoded.action_mask,
                 "checkpoint_path": str(self.torch_checkpoint),
                 "temperature": self.temperature,
                 "action_id": ACTION_TO_ID[action],
+                "patch_candidate_id": patch_candidate_id,
+                "patch_candidate_label": provider.label(memory.task, patch_candidate_id),
+                "patch_candidate_is_correct": (
+                    provider.label(memory.task, patch_candidate_id) == "correct" if patch_candidate_id else None
+                ),
             },
         )
 
@@ -266,22 +311,13 @@ def create_agent(name: str, checkpoint: Path | None = None) -> Agent:
     raise ValueError(f"Unknown agent: {name}")
 
 
-def _expert_patch_for_task(task: TaskSpec) -> dict[str, str]:
-    source_case = str(task.metadata.get("source_case", ""))
-    if not source_case:
-        return {}
-    from .benchmark import expert_patch_for_case
-
-    return expert_patch_for_case(source_case)
-
-
 def save_policy_checkpoint(path: Path, action_scores: dict[str, float], metadata: dict[str, Any] | None = None) -> None:
     metadata = metadata or {}
     payload = {
         "action_scores": {action: float(action_scores.get(action, 0.0)) for action in ACTIONS},
-        "scripted_patch": bool(metadata.get("scripted_patch", True)),
-        "training_target": metadata.get("training_target", "tool_policy"),
-        "patch_generation": metadata.get("patch_generation", "expert_patch_provider"),
+        "scripted_patch": bool(metadata.get("scripted_patch", False)),
+        "training_target": metadata.get("training_target", "tool_policy_with_patch_ranker"),
+        "patch_generation": metadata.get("patch_generation", "patch_candidate_ranking"),
         "torch_checkpoint": metadata.get("torch_checkpoint"),
         "metadata": metadata,
     }

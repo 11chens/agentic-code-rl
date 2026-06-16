@@ -2,14 +2,14 @@
 
 Agentic Code RL is a compact research-style project for evaluating and training tool-using code repair agents. The core harness is SWE-bench-style: each episode copies a small buggy Python repository into an isolated workspace, exposes only public tests to the agent, applies patches through guarded tools, and reserves hidden tests for final grading.
 
-The trainable component is a small Transformer tool policy over discrete actions. It learns when to call tools such as `read_file`, `search_code`, `apply_patch`, `run_tests`, and `finish`. The current policy does not generate code diffs itself; `apply_patch` still uses the synthetic expert patch provider.
+The trainable component is a small hierarchical Transformer policy. It first predicts the next tool action, and when the action is `apply_patch`, it ranks a fixed synthetic patch-candidate set and passes the selected payload to the guarded patch tool. It still does not generate arbitrary code diffs from scratch.
 
 For a cold-start handoff to another agent, read [docs/COLD_START_HANDOFF.md](docs/COLD_START_HANDOFF.md). For training commands, read [docs/TRAINING_QUICKSTART.md](docs/TRAINING_QUICKSTART.md).
 
 ## What It Demonstrates
 
 - Agent architecture: planner, memory, tool calls, reflection, trajectory logging.
-- RL surfaces: scripted SFT warm start, rollout PPO, and group-relative GRPO over tool actions.
+- RL surfaces: scripted SFT warm start, rollout PPO, and group-relative GRPO over tool actions plus patch-candidate ranking.
 - Evaluation harness: isolated workspaces, hidden-test grading, patch validity, tool cost, pass rate, runtime, trace artifacts.
 - Engineering: reproducible synthetic benchmark, PyTorch checkpoints, JSON metadata artifacts, CLI, tests, and reports.
 
@@ -74,6 +74,7 @@ src/agentic_code_rl/
   environment.py    isolated workspaces and private hidden-test runner
   tools.py          guarded code-repair tool layer
   agents.py         scripted, ReAct fallback, and learned-policy agents
+  patch_candidates.py synthetic candidate patch artifacts and provider
   policy.py         Transformer tool-policy feature encoder and model
   runner.py         episode loop, memory, reward, trajectory artifacts
   training.py       SFT/PPO/GRPO training entrypoints
@@ -94,4 +95,4 @@ src/agentic_code_rl/
 
 - Built a SWE-bench-style code-repair evaluation harness with isolated workspaces, guarded file search, controlled patch application, public-test interaction, private hidden-test grading, and trajectory logging.
 - Implemented public/hidden-test reward shaping and comparable ReAct/SFT/PPO/GRPO entrypoints over pass rate, tool cost, invalid patch rate, and runtime.
-- Designed a reproducible synthetic benchmark with path guards, hidden-test isolation, separate expert traces, and resumeable training artifacts.
+- Designed a reproducible synthetic benchmark with path guards, hidden-test isolation, patch-candidate artifacts, separate expert traces, and resumeable training artifacts.

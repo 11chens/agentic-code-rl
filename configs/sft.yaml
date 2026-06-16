@@ -12,6 +12,15 @@ test_timeout_sec: 30
 device: cuda
 resume_from: null
 
+patch_ranking:
+  enabled: true
+  candidates_dir: data/patch_candidates
+  max_candidates: 6
+  patch_text_len: 384
+  patch_loss_coef: 1.0
+  candidate_temperature: 1.0
+  candidate_epsilon: 0.1
+
 model:
   vocab_size: 8192
   task_text_len: 128
